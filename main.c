@@ -823,7 +823,8 @@ static void refresh_dir(void) {
         gboolean is_image = !is_dir && ext && (
             g_ascii_strcasecmp(ext, ".png") == 0 || g_ascii_strcasecmp(ext, ".jpg") == 0 ||
             g_ascii_strcasecmp(ext, ".jpeg") == 0 || g_ascii_strcasecmp(ext, ".gif") == 0 ||
-            g_ascii_strcasecmp(ext, ".webp") == 0 || g_ascii_strcasecmp(ext, ".bmp") == 0
+            g_ascii_strcasecmp(ext, ".webp") == 0 || g_ascii_strcasecmp(ext, ".bmp") == 0 ||
+            g_ascii_strcasecmp(ext, ".svg") == 0 || g_ascii_strcasecmp(ext, ".svgz") == 0
         );
 
         if (is_image) {
