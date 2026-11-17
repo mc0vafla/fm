@@ -108,7 +108,6 @@ typedef struct {
     GtkListStore *list_store;
     GtkWidget *bookmarks_box;
     GtkWidget *status_label;
-    GtkWidget *view_toggle_btn;
 
     char *current_dir;
     gboolean show_hidden;
@@ -155,6 +154,7 @@ static void on_menu_properties(GtkMenuItem *item, gpointer data);
 static void unpin_path_from_bookmarks(const char *path);
 static gboolean is_path_in_gtk_bookmarks(const char *path);
 static void add_sidebar_item(const char *label, const char *path, const char *icon_name, gboolean is_trash, gboolean is_mount, GMount *mount);
+static GdkPixbuf *get_fast_file_icon(gboolean is_dir, const char *name, int size);
 
 typedef struct {
     GtkWidget *dialog;
@@ -1606,6 +1606,65 @@ static void on_menu_set_default_app(GtkMenuItem *item, gpointer data) {
     free_string_list(&sel);
 }
 
+typedef struct {
+    char *path;
+    GtkWidget *size_label;
+    guint64 total_size;
+    guint64 file_count;
+    guint64 dir_count;
+    gboolean cancelled;
+} DirSizeTask;
+
+static void calculate_dir_size_recursive(const char *dir_path, DirSizeTask *task) {
+    if (task->cancelled) return;
+
+    GDir *dir = g_dir_open(dir_path, 0, NULL);
+    if (!dir) return;
+
+    const char *name;
+    while ((name = g_dir_read_name(dir)) != NULL) {
+        if (task->cancelled) break;
+        char *full_path = g_build_filename(dir_path, name, NULL);
+        
+        struct stat st;
+        if (lstat(full_path, &st) == 0) {
+            if (S_ISDIR(st.st_mode)) {
+                task->dir_count++;
+                calculate_dir_size_recursive(full_path, task);
+            } else if (S_ISREG(st.st_mode)) {
+                task->file_count++;
+                task->total_size += st.st_size;
+            }
+        }
+        g_free(full_path);
+    }
+    g_dir_close(dir);
+}
+
+static gboolean update_size_label_idle(gpointer user_data) {
+    DirSizeTask *task = user_data;
+    if (!task->cancelled && task->size_label && GTK_IS_WIDGET(task->size_label)) {
+        char *sz_str = format_size(task->total_size, FALSE);
+        char buf[256];
+        snprintf(buf, sizeof(buf), "%s (%llu bytes, %llu files, %llu folders)", 
+                 sz_str, (unsigned long long)task->total_size, 
+                 (unsigned long long)task->file_count, 
+                 (unsigned long long)task->dir_count);
+        gtk_label_set_text(GTK_LABEL(task->size_label), buf);
+        g_free(sz_str);
+    }
+    g_free(task->path);
+    g_free(task);
+    return G_SOURCE_REMOVE;
+}
+
+static gpointer dir_size_worker(gpointer data) {
+    DirSizeTask *task = data;
+    calculate_dir_size_recursive(task->path, task);
+    g_idle_add(update_size_label_idle, task);
+    return NULL;
+}
+
 static void open_file_properties_dialog(const char *path) {
     if (!path) return;
 
@@ -1650,7 +1709,9 @@ static void open_file_properties_dialog(const char *path) {
     gtk_grid_set_column_spacing(GTK_GRID(grid), 12);
 
     int row = 0;
-    #define ADD_INFO_ROW(k_text, v_text) do { \
+    GtkWidget *size_val_lbl = NULL;
+
+    #define ADD_INFO_ROW(k_text, v_text, is_size_row) do { \
         GtkWidget *k_lbl = gtk_label_new(k_text); \
         gtk_widget_set_halign(k_lbl, GTK_ALIGN_START); \
         PangoAttrList *k_attrs = pango_attr_list_new(); \
@@ -1660,39 +1721,46 @@ static void open_file_properties_dialog(const char *path) {
         GtkWidget *v_lbl = gtk_label_new(v_text); \
         gtk_widget_set_halign(v_lbl, GTK_ALIGN_START); \
         gtk_label_set_selectable(GTK_LABEL(v_lbl), TRUE); \
+        if (is_size_row) size_val_lbl = v_lbl; \
         gtk_grid_attach(GTK_GRID(grid), k_lbl, 0, row, 1, 1); \
         gtk_grid_attach(GTK_GRID(grid), v_lbl, 1, row, 1, 1); \
         row++; \
     } while(0)
 
-    ADD_INFO_ROW("Path:", path);
+    ADD_INFO_ROW("Path:", path, FALSE);
 
     char type_buf[64];
     if (S_ISDIR(st.st_mode)) strcpy(type_buf, "Directory");
     else if (S_ISLNK(st.st_mode)) strcpy(type_buf, "Symbolic Link");
     else if (S_ISREG(st.st_mode)) strcpy(type_buf, "Regular File");
     else strcpy(type_buf, "Special File");
-    ADD_INFO_ROW("Type:", type_buf);
+    ADD_INFO_ROW("Type:", type_buf, FALSE);
 
-    if (!S_ISDIR(st.st_mode)) {
+    if (S_ISDIR(st.st_mode)) {
+        ADD_INFO_ROW("Size:", "Calculating...", TRUE);
+        DirSizeTask *task = g_new0(DirSizeTask, 1);
+        task->path = g_strdup(path);
+        task->size_label = size_val_lbl;
+        g_thread_new("dir-size-scanner", dir_size_worker, task);
+    } else {
         char *sz_str = format_size(st.st_size, FALSE);
         char sz_detailed[128];
         snprintf(sz_detailed, sizeof(sz_detailed), "%s (%lld bytes)", sz_str, (long long)st.st_size);
-        ADD_INFO_ROW("Size:", sz_detailed);
+        ADD_INFO_ROW("Size:", sz_detailed, FALSE);
         g_free(sz_str);
     }
 
     char time_buf[128];
     struct tm *timeinfo = localtime(&st.st_mtime);
     strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", timeinfo);
-    ADD_INFO_ROW("Modified:", time_buf);
+    ADD_INFO_ROW("Modified:", time_buf, FALSE);
 
     char uid_buf[32], gid_buf[32];
     snprintf(uid_buf, sizeof(uid_buf), "%d", st.st_uid);
     snprintf(gid_buf, sizeof(gid_buf), "%d", st.st_gid);
     char owner_str[128];
     snprintf(owner_str, sizeof(owner_str), "UID: %s, GID: %s", uid_buf, gid_buf);
-    ADD_INFO_ROW("Owner/Group:", owner_str);
+    ADD_INFO_ROW("Owner/Group:", owner_str, FALSE);
 
     #undef ADD_INFO_ROW
 
@@ -2222,31 +2290,6 @@ static gboolean on_view_scroll_event(GtkWidget *widget, GdkEventScroll *ev, gpoi
         return TRUE;
     }
     return FALSE;
-}
-
-static void on_view_toggle_clicked(GtkButton *btn, gpointer data) {
-    (void)btn; (void)data;
-    GList *sel = get_selected_paths();
-    if (!sel || !sel->data) {
-        free_string_list(&sel);
-        if (app.view_mode == VIEW_MODE_LIST) {
-            switch_view_mode(VIEW_MODE_ICONS);
-        } else {
-            switch_view_mode(VIEW_MODE_LIST);
-        }
-        return;
-    }
-    char *path = sel->data;
-    if (g_file_test(path, G_FILE_TEST_IS_DIR)) {
-        navigate_to(path, TRUE);
-    } else {
-        char *uri = g_filename_to_uri(path, NULL, NULL);
-        if (uri) {
-            g_app_info_launch_default_for_uri(uri, NULL, NULL);
-            g_free(uri);
-        }
-    }
-    free_string_list(&sel);
 }
 
 typedef struct {
@@ -3016,12 +3059,10 @@ static void build_ui(void) {
     GtkWidget *btn_back  = gtk_button_new_from_icon_name("go-previous", GTK_ICON_SIZE_BUTTON);
     GtkWidget *btn_fwd   = gtk_button_new_from_icon_name("go-next", GTK_ICON_SIZE_BUTTON);
     GtkWidget *btn_up    = gtk_button_new_from_icon_name("go-up", GTK_ICON_SIZE_BUTTON);
-    app.view_toggle_btn  = gtk_button_new_from_icon_name("view-grid-symbolic", GTK_ICON_SIZE_BUTTON);
 
     g_signal_connect_swapped(btn_back, "clicked", G_CALLBACK(execute_action), GINT_TO_POINTER(ACT_BACK));
     g_signal_connect_swapped(btn_fwd,  "clicked", G_CALLBACK(execute_action), GINT_TO_POINTER(ACT_FORWARD));
     g_signal_connect_swapped(btn_up,   "clicked", G_CALLBACK(execute_action), GINT_TO_POINTER(ACT_UP));
-    g_signal_connect(app.view_toggle_btn, "clicked", G_CALLBACK(on_view_toggle_clicked), NULL);
 
     app.path_entry = gtk_entry_new();
     g_signal_connect(app.path_entry, "activate", G_CALLBACK(on_path_activate), NULL);
@@ -3030,7 +3071,6 @@ static void build_ui(void) {
     gtk_box_pack_start(GTK_BOX(toolbar), btn_fwd,  FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(toolbar), btn_up,   FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(toolbar), app.path_entry, TRUE, TRUE, 0);
-    gtk_box_pack_start(GTK_BOX(toolbar), app.view_toggle_btn, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(vbox), toolbar, FALSE, FALSE, 0);
 
     GtkWidget *main_paned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
