@@ -150,6 +150,7 @@ static void switch_view_mode(ViewMode mode);
 static void update_status_bar_info(void);
 static void save_config(void);
 static void open_currently_selected(void);
+static void on_menu_properties(GtkMenuItem *item, gpointer data);
 
 typedef struct {
     GtkWidget *dialog;
@@ -1567,6 +1568,115 @@ static void on_menu_set_default_app(GtkMenuItem *item, gpointer data) {
     free_string_list(&sel);
 }
 
+static void open_file_properties_dialog(const char *path) {
+    if (!path) return;
+
+    struct stat st;
+    if (lstat(path, &st) != 0) {
+        set_status("Cannot stat file: %s", strerror(errno));
+        return;
+    }
+
+    GtkWidget *dlg = gtk_dialog_new_with_buttons(
+        "File Properties", GTK_WINDOW(app.window),
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        "Close", GTK_RESPONSE_CLOSE, NULL);
+
+    GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dlg));
+    gtk_container_set_border_width(GTK_CONTAINER(content), 14);
+    gtk_box_set_spacing(GTK_BOX(content), 10);
+
+    GtkWidget *hbox_top = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    char *base_name = g_path_get_basename(path);
+    GdkPixbuf *pix = get_fast_file_icon(S_ISDIR(st.st_mode), base_name, 48);
+    GtkWidget *img = gtk_image_new_from_pixbuf(pix);
+    if (pix) g_object_unref(pix);
+
+    GtkWidget *lbl_name = gtk_label_new(base_name);
+    PangoAttrList *attrs = pango_attr_list_new();
+    pango_attr_list_insert(attrs, pango_attr_weight_new(PANGO_WEIGHT_BOLD));
+    gtk_label_set_attributes(GTK_LABEL(lbl_name), attrs);
+    pango_attr_list_unref(attrs);
+    gtk_widget_set_halign(lbl_name, GTK_ALIGN_START);
+    gtk_label_set_ellipsize(GTK_LABEL(lbl_name), PANGO_ELLIPSIZE_MIDDLE);
+
+    gtk_box_pack_start(GTK_BOX(hbox_top), img, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(hbox_top), lbl_name, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(content), hbox_top, FALSE, FALSE, 0);
+
+    GtkWidget *sep = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_box_pack_start(GTK_BOX(content), sep, FALSE, FALSE, 4);
+
+    GtkWidget *grid = gtk_grid_new();
+    gtk_grid_set_row_spacing(GTK_GRID(grid), 6);
+    gtk_grid_set_column_spacing(GTK_GRID(grid), 12);
+
+    int row = 0;
+    #define ADD_INFO_ROW(k_text, v_text) do { \
+        GtkWidget *k_lbl = gtk_label_new(k_text); \
+        gtk_widget_set_halign(k_lbl, GTK_ALIGN_START); \
+        PangoAttrList *k_attrs = pango_attr_list_new(); \
+        pango_attr_list_insert(k_attrs, pango_attr_weight_new(PANGO_WEIGHT_SEMIBOLD)); \
+        gtk_label_set_attributes(GTK_LABEL(k_lbl), k_attrs); \
+        pango_attr_list_unref(k_attrs); \
+        GtkWidget *v_lbl = gtk_label_new(v_text); \
+        gtk_widget_set_halign(v_lbl, GTK_ALIGN_START); \
+        gtk_label_set_selectable(GTK_LABEL(v_lbl), TRUE); \
+        gtk_grid_attach(GTK_GRID(grid), k_lbl, 0, row, 1, 1); \
+        gtk_grid_attach(GTK_GRID(grid), v_lbl, 1, row, 1, 1); \
+        row++; \
+    } while(0)
+
+    ADD_INFO_ROW("Path:", path);
+
+    char type_buf[64];
+    if (S_ISDIR(st.st_mode)) strcpy(type_buf, "Directory");
+    else if (S_ISLNK(st.st_mode)) strcpy(type_buf, "Symbolic Link");
+    else if (S_ISREG(st.st_mode)) strcpy(type_buf, "Regular File");
+    else strcpy(type_buf, "Special File");
+    ADD_INFO_ROW("Type:", type_buf);
+
+    if (!S_ISDIR(st.st_mode)) {
+        char *sz_str = format_size(st.st_size, FALSE);
+        char sz_detailed[128];
+        snprintf(sz_detailed, sizeof(sz_detailed), "%s (%lld bytes)", sz_str, (long long)st.st_size);
+        ADD_INFO_ROW("Size:", sz_detailed);
+        g_free(sz_str);
+    }
+
+    char time_buf[128];
+    struct tm *timeinfo = localtime(&st.st_mtime);
+    strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", timeinfo);
+    ADD_INFO_ROW("Modified:", time_buf);
+
+    char uid_buf[32], gid_buf[32];
+    snprintf(uid_buf, sizeof(uid_buf), "%d", st.st_uid);
+    snprintf(gid_buf, sizeof(gid_buf), "%d", st.st_gid);
+    char owner_str[128];
+    snprintf(owner_str, sizeof(owner_str), "UID: %s, GID: %s", uid_buf, gid_buf);
+    ADD_INFO_ROW("Owner/Group:", owner_str);
+
+    #undef ADD_INFO_ROW
+
+    gtk_box_pack_start(GTK_BOX(content), grid, FALSE, FALSE, 0);
+
+    gtk_widget_show_all(dlg);
+    gtk_dialog_run(GTK_DIALOG(dlg));
+    gtk_widget_destroy(dlg);
+    g_free(base_name);
+}
+
+static void on_menu_properties(GtkMenuItem *item, gpointer data) {
+    (void)item; (void)data;
+    GList *sel = get_selected_paths();
+    if (!sel || !sel->data) {
+        free_string_list(&sel);
+        return;
+    }
+    open_file_properties_dialog((const char *)sel->data);
+    free_string_list(&sel);
+}
+
 static void execute_action(ActionId act) {
     switch (act) {
         case ACT_NEW_FILE: {
@@ -1918,6 +2028,11 @@ static gboolean handle_context_menu(GdkEventButton *ev, gboolean is_row) {
 
             gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
 
+
+            gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
+            item = gtk_menu_item_new_with_label("Properties...");
+            g_signal_connect(item, "activate", G_CALLBACK(on_menu_properties), NULL);
+            gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
             item = gtk_menu_item_new_with_label("Move to Trash");
             g_signal_connect(item, "activate", G_CALLBACK(on_menu_trash), NULL);
             gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
