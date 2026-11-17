@@ -90,6 +90,13 @@ typedef struct {
 } CustomAction;
 
 typedef struct {
+    char *full_path;
+    int icon_size;
+    guint gen_id;
+    GtkTreeRowReference *row_ref;
+} ThumbnailTask;
+
+typedef struct {
     GtkWidget *window;
     GtkWidget *path_entry;
     GtkWidget *content_stack;
@@ -123,13 +130,6 @@ typedef struct {
 
     GFileMonitor *dir_monitor;
 } AppState;
-
-typedef struct {
-    char *full_path;
-    int icon_size;
-    guint gen_id;
-    GtkTreeRowReference *row_ref;
-} ThumbnailTask;
 
 static AppState app = {0};
 
@@ -1044,25 +1044,6 @@ static void clipboard_get_func(GtkClipboard *clipboard, GtkSelectionData *select
 
 static void clipboard_clear_func(GtkClipboard *clipboard, gpointer user_data) {
     (void)clipboard; (void)user_data;
-}
-
-/* --- Drag and Drop Source Callbacks --- */
-static void on_drag_data_get(GtkWidget *widget, GdkDragContext *context, GtkSelectionData *selection_data, guint info, guint time, gpointer user_data) {
-    (void)widget; (void)context; (void)info; (void)time; (void)user_data;
-    GList *sel = get_selected_paths();
-    if (!sel) return;
-
-    GString *uri_list = g_string_new(NULL);
-    for (GList *l = sel; l != NULL; l = l->next) {
-        char *uri = g_filename_to_uri((const char *)l->data, NULL, NULL);
-        if (uri) {
-            g_string_append_printf(uri_list, "%s\r\n", uri);
-            g_free(uri);
-        }
-    }
-    gtk_selection_data_set(selection_data, gtk_selection_data_get_target(selection_data), 8, (const guchar *)uri_list->str, (gint)uri_list->len);
-    g_string_free(uri_list, TRUE);
-    free_string_list(&sel);
 }
 
 static void switch_view_mode(ViewMode mode) {
@@ -2730,6 +2711,8 @@ static void build_ui(void) {
     app.list_store = gtk_list_store_new(NUM_COLS, GDK_TYPE_PIXBUF, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_BOOLEAN, G_TYPE_STRING);
 
     app.tree_view = gtk_tree_view_new_with_model(GTK_TREE_MODEL(app.list_store));
+    gtk_tree_view_set_rubber_banding(GTK_TREE_VIEW(app.tree_view), TRUE);
+    
     GtkTreeSelection *tree_sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(app.tree_view));
     gtk_tree_selection_set_mode(tree_sel, GTK_SELECTION_MULTIPLE);
     g_signal_connect_swapped(tree_sel, "changed", G_CALLBACK(on_selection_changed), NULL);
@@ -2759,6 +2742,7 @@ static void build_ui(void) {
     gtk_container_add(GTK_CONTAINER(tree_scroll), app.tree_view);
 
     app.icon_view = gtk_icon_view_new_with_model(GTK_TREE_MODEL(app.list_store));
+
     gtk_icon_view_set_pixbuf_column(GTK_ICON_VIEW(app.icon_view), COL_PIXBUF);
     gtk_icon_view_set_text_column(GTK_ICON_VIEW(app.icon_view), COL_NAME);
     gtk_icon_view_set_selection_mode(GTK_ICON_VIEW(app.icon_view), GTK_SELECTION_MULTIPLE);
@@ -2784,18 +2768,6 @@ static void build_ui(void) {
     g_signal_connect(app.icon_view, "item-activated", G_CALLBACK(on_icon_activated), NULL);
     g_signal_connect(app.icon_view, "button-press-event", G_CALLBACK(on_icon_view_button_press), NULL);
     g_signal_connect(app.icon_view, "scroll-event", G_CALLBACK(on_view_scroll_event), NULL);
-
-    /* --- Настройка Drag and Drop Source для TreeView и IconView --- */
-    {
-        static GtkTargetEntry drag_targets[] = {
-            { (gchar *) "text/uri-list", 0, 0 }
-        };
-        gtk_drag_source_set(app.tree_view, GDK_BUTTON1_MASK, drag_targets, 1, GDK_ACTION_COPY | GDK_ACTION_MOVE);
-        g_signal_connect(app.tree_view, "drag-data-get", G_CALLBACK(on_drag_data_get), NULL);
-
-        gtk_drag_source_set(app.icon_view, GDK_BUTTON1_MASK, drag_targets, 1, GDK_ACTION_COPY | GDK_ACTION_MOVE);
-        g_signal_connect(app.icon_view, "drag-data-get", G_CALLBACK(on_drag_data_get), NULL);
-    }
 
     GtkWidget *icon_scroll = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(icon_scroll), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
