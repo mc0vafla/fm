@@ -61,6 +61,7 @@ typedef enum {
     ACT_SORT_NAME,
     ACT_SORT_SIZE,
     ACT_SORT_TIME,
+    ACT_PIN_CURRENT,
     ACT_COUNT
 } ActionId;
 
@@ -151,6 +152,9 @@ static void update_status_bar_info(void);
 static void save_config(void);
 static void open_currently_selected(void);
 static void on_menu_properties(GtkMenuItem *item, gpointer data);
+static void unpin_path_from_bookmarks(const char *path);
+static gboolean is_path_in_gtk_bookmarks(const char *path);
+static void add_sidebar_item(const char *label, const char *path, const char *icon_name, gboolean is_trash, gboolean is_mount, GMount *mount);
 
 typedef struct {
     GtkWidget *dialog;
@@ -595,6 +599,7 @@ static void init_default_binds(void) {
     app.binds[ACT_REFRESH]        = (Keybind){"refresh",        "Refresh",         GDK_KEY_r,         GDK_CONTROL_MASK};
     app.binds[ACT_HIDDEN]         = (Keybind){"hidden",         "Toggle Hidden",   GDK_KEY_h,         GDK_CONTROL_MASK};
     app.binds[ACT_FOCUS_PATH]     = (Keybind){"focus_path",     "Focus Path Bar",  GDK_KEY_l,         GDK_CONTROL_MASK};
+    app.binds[ACT_PIN_CURRENT]    = (Keybind){"pin_current",     "Pin Current Dir", GDK_KEY_d,         GDK_CONTROL_MASK};
     app.binds[ACT_SETTINGS]       = (Keybind){"settings",       "Preferences",     GDK_KEY_comma,     GDK_CONTROL_MASK};
     app.binds[ACT_CUSTOM_MENU_CFG]= (Keybind){"custom_menu",    "Custom Actions",  GDK_KEY_comma,     GDK_MOD1_MASK};
     app.binds[ACT_VIEW_LIST]      = (Keybind){"view_list",      "List View",       GDK_KEY_1,         GDK_CONTROL_MASK};
@@ -1196,6 +1201,44 @@ static void set_sort_mode(SortMode mode) {
     refresh_dir();
 }
 
+static gboolean is_path_in_gtk_bookmarks(const char *path) {
+    if (!path) return FALSE;
+    char *bm_path = g_build_filename(g_get_user_config_dir(), "gtk-3.0", "bookmarks", NULL);
+    if (!g_file_test(bm_path, G_FILE_TEST_EXISTS)) {
+        g_free(bm_path);
+        bm_path = g_build_filename(g_get_home_dir(), ".gtk-bookmarks", NULL);
+    }
+
+    char *uri = g_filename_to_uri(path, NULL, NULL);
+    if (!uri) {
+        g_free(bm_path);
+        return FALSE;
+    }
+
+    gboolean found = FALSE;
+    char *content = NULL;
+    if (g_file_get_contents(bm_path, &content, NULL, NULL)) {
+        char **lines = g_strsplit(content, "\n", -1);
+        for (int i = 0; lines[i] != NULL; i++) {
+            char *line = g_strstrip(lines[i]);
+            if (*line == '\0' || *line == '#') continue;
+            char *space = strchr(line, ' ');
+            char *u = space ? g_strndup(line, space - line) : g_strdup(line);
+            if (g_strcmp0(u, uri) == 0) {
+                found = TRUE;
+                g_free(u);
+                break;
+            }
+            g_free(u);
+        }
+        g_strfreev(lines);
+        g_free(content);
+    }
+    g_free(uri);
+    g_free(bm_path);
+    return found;
+}
+
 static void pin_path_to_bookmarks(const char *path) {
     if (!path || !g_file_test(path, G_FILE_TEST_IS_DIR)) return;
     char *bm_path = g_build_filename(g_get_user_config_dir(), "gtk-3.0", "bookmarks", NULL);
@@ -1210,12 +1253,7 @@ static void pin_path_to_bookmarks(const char *path) {
         return;
     }
 
-    char *content = NULL;
-    gboolean exists = FALSE;
-    if (g_file_get_contents(bm_path, &content, NULL, NULL)) {
-        if (strstr(content, uri)) exists = TRUE;
-        g_free(content);
-    }
+    gboolean exists = is_path_in_gtk_bookmarks(path);
 
     if (!exists) {
         FILE *fp = fopen(bm_path, "a");
@@ -1695,6 +1733,11 @@ static void execute_action(ActionId act) {
             g_free(name);
             break;
         }
+        case ACT_PIN_CURRENT:
+            if (app.current_dir && !g_str_has_prefix(app.current_dir, "trash:///")) {
+                pin_path_to_bookmarks(app.current_dir);
+            }
+            break;
         case ACT_NEW_DIR: {
             char *name = prompt_text("New Directory", "Directory name:", NULL);
             if (!name) break;
@@ -2449,12 +2492,12 @@ static void on_sidebar_eject(GtkMenuItem *item, gpointer data) {
 static gboolean on_sidebar_button_press(GtkWidget *widget, GdkEventButton *ev, gpointer data) {
     (void)widget;
     SidebarCtx *ctx = data;
-    gboolean is_home = ctx->path && (g_strcmp0(ctx->path, g_get_home_dir()) == 0);
-    const char *desktop_path = g_get_user_special_dir(G_USER_DIRECTORY_DESKTOP);
-    if (!desktop_path) desktop_path = g_build_filename(g_get_home_dir(), "Desktop", NULL);
-    gboolean is_desktop = ctx->path && (g_strcmp0(ctx->path, desktop_path) == 0);
+    
     if (ev->type == GDK_BUTTON_PRESS && ev->button == 3) {
-        if (is_home || is_desktop) {
+        gboolean is_default_system = (ctx->path && (g_strcmp0(ctx->path, g_get_home_dir()) == 0)) || 
+                                     (ctx->path && (g_strcmp0(ctx->path, g_get_user_special_dir(G_USER_DIRECTORY_DESKTOP) ? g_get_user_special_dir(G_USER_DIRECTORY_DESKTOP) : "") == 0));
+        
+        if (is_default_system && !is_path_in_gtk_bookmarks(ctx->path)) {
             return TRUE; 
         }
 
@@ -2681,7 +2724,7 @@ static void load_bookmarks(void) {
         char **lines = g_strsplit(content, "\n", -1);
         for (int i = 0; lines[i] != NULL; i++) {
             char *line = g_strstrip(lines[i]);
-            if (*line == '\0' || *line == '#') continue;
+            if (*line == '\0' || *line == '#') continue; 
 
             char *space = strchr(line, ' ');
             char *uri = space ? g_strndup(line, space - line) : g_strdup(line);
@@ -2850,7 +2893,7 @@ static void process_quick_search_input(guint keyval) {
         valid = gtk_tree_model_iter_next(model, &iter);
     }
 
-if (best_path && best_score > 0) {
+    if (best_path && best_score > 0) {
         if (app.view_mode == VIEW_MODE_LIST) {
             GtkTreeSelection *sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(app.tree_view));
             gtk_tree_selection_unselect_all(sel);
