@@ -2250,7 +2250,15 @@ static void on_sidebar_eject(GtkMenuItem *item, gpointer data) {
 static gboolean on_sidebar_button_press(GtkWidget *widget, GdkEventButton *ev, gpointer data) {
     (void)widget;
     SidebarCtx *ctx = data;
+    gboolean is_home = ctx->path && (g_strcmp0(ctx->path, g_get_home_dir()) == 0);
+    const char *desktop_path = g_get_user_special_dir(G_USER_DIRECTORY_DESKTOP);
+    if (!desktop_path) desktop_path = g_build_filename(g_get_home_dir(), "Desktop", NULL);
+    gboolean is_desktop = ctx->path && (g_strcmp0(ctx->path, desktop_path) == 0);
     if (ev->type == GDK_BUTTON_PRESS && ev->button == 3) {
+        if (is_home || is_desktop) {
+            return TRUE; 
+        }
+
         GtkWidget *menu = gtk_menu_new();
         GtkWidget *item;
 
