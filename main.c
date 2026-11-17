@@ -2,6 +2,8 @@
 #define _GNU_SOURCE
 #endif
 
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <gtk/gtk.h>
 #include <gio/gio.h>
 #include <gdk/gdkkeysyms.h>
@@ -147,6 +149,84 @@ static void load_bookmarks(void);
 static void switch_view_mode(ViewMode mode);
 static void update_status_bar_info(void);
 static void save_config(void);
+static void open_currently_selected(void);
+
+typedef struct {
+    GtkWidget *dialog;
+    GtkWidget *progress_bar;
+    GPid pid;
+    guint timeout_id;
+    char *success_message;
+} ProgressCtx;
+
+static gboolean on_progress_tick(gpointer user_data) {
+    ProgressCtx *ctx = user_data;
+    if (!ctx || !ctx->progress_bar) return G_SOURCE_REMOVE;
+    
+    gtk_progress_bar_pulse(GTK_PROGRESS_BAR(ctx->progress_bar));
+
+    int status = 0;
+    pid_t result = waitpid(ctx->pid, &status, WNOHANG);
+    if (result != 0) {
+        if (ctx->dialog && GTK_IS_WIDGET(ctx->dialog)) {
+            gtk_widget_destroy(ctx->dialog);
+        }
+        g_spawn_close_pid(ctx->pid);
+        refresh_dir();
+        if (ctx->success_message) {
+            set_status("%s", ctx->success_message);
+            g_free(ctx->success_message);
+        }
+        g_free(ctx);
+        return G_SOURCE_REMOVE;
+    }
+    return G_SOURCE_CONTINUE;
+}
+
+static void run_command_with_progress(const char *title, const char *cmd, const char *success_msg) {
+    GError *err = NULL;
+    gchar **argv = NULL;
+    if (!g_shell_parse_argv(cmd, NULL, &argv, &err)) {
+        set_status("Command parse error: %s", err ? err->message : "");
+        if (err) g_error_free(err);
+        return;
+    }
+
+    GPid pid = 0;
+    if (!g_spawn_async(app.current_dir, argv, NULL, G_SPAWN_DO_NOT_REAP_CHILD | G_SPAWN_SEARCH_PATH, NULL, NULL, &pid, &err)) {
+        set_status("Spawn error: %s", err ? err->message : "");
+        if (err) g_error_free(err);
+        g_strfreev(argv);
+        return;
+    }
+    g_strfreev(argv);
+
+    GtkWidget *dlg = gtk_dialog_new();
+    gtk_window_set_transient_for(GTK_WINDOW(dlg), GTK_WINDOW(app.window));
+    gtk_window_set_modal(GTK_WINDOW(dlg), TRUE);
+    gtk_window_set_destroy_with_parent(GTK_WINDOW(dlg), TRUE);
+    gtk_window_set_title(GTK_WINDOW(dlg), title);
+    gtk_window_set_default_size(GTK_WINDOW(dlg), 350, 100);
+
+    GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dlg));
+    gtk_container_set_border_width(GTK_CONTAINER(content), 16);
+    gtk_box_set_spacing(GTK_BOX(content), 12);
+
+    GtkWidget *lbl = gtk_label_new("Processing, please wait...");
+    gtk_widget_set_halign(lbl, GTK_ALIGN_START);
+    GtkWidget *pbar = gtk_progress_bar_new();
+
+    gtk_box_pack_start(GTK_BOX(content), lbl, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(content), pbar, FALSE, FALSE, 0);
+    gtk_widget_show_all(dlg);
+
+    ProgressCtx *ctx = g_new0(ProgressCtx, 1);
+    ctx->dialog = dlg;
+    ctx->progress_bar = pbar;
+    ctx->pid = pid;
+    ctx->success_message = success_msg ? g_strdup(success_msg) : NULL;
+    ctx->timeout_id = g_timeout_add(100, on_progress_tick, ctx);
+}
 
 static char *format_size(goffset size, gboolean is_dir) {
     if (is_dir) return g_strdup("<DIR>");
@@ -592,33 +672,6 @@ static gboolean delete_recursive(GFile *file, GError **error) {
         g_object_unref(en);
     }
     return g_file_delete(file, NULL, error);
-}
-
-static gboolean copy_recursive(GFile *src, GFile *dst, GError **error) {
-    GFileType type = g_file_query_file_type(src, G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, NULL);
-    if (type == G_FILE_TYPE_DIRECTORY) {
-        if (!g_file_make_directory(dst, NULL, error)) return FALSE;
-        GFileEnumerator *en = g_file_enumerate_children(src, G_FILE_ATTRIBUTE_STANDARD_NAME,
-                                                        G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, NULL, error);
-        if (!en) return FALSE;
-        GFileInfo *info;
-        while ((info = g_file_enumerator_next_file(en, NULL, error)) != NULL) {
-            const char *name = g_file_info_get_name(info);
-            GFile *c_src = g_file_get_child(src, name);
-            GFile *c_dst = g_file_get_child(dst, name);
-            gboolean ok = copy_recursive(c_src, c_dst, error);
-            g_object_unref(c_src);
-            g_object_unref(c_dst);
-            g_object_unref(info);
-            if (!ok) {
-                g_object_unref(en);
-                return FALSE;
-            }
-        }
-        g_object_unref(en);
-        return TRUE;
-    }
-    return g_file_copy(src, dst, G_FILE_COPY_NOFOLLOW_SYMLINKS, NULL, NULL, NULL, error);
 }
 
 static char *find_latest_in_trash(const char *orig_path) {
@@ -1244,8 +1297,7 @@ static void on_menu_compress_zip(GtkMenuItem *item, gpointer data) {
         g_string_append(cmd, q_path);
         g_free(q_path);
     }
-    char *argv[] = { "/bin/sh", "-c", cmd->str, NULL };
-    g_spawn_async(app.current_dir, argv, NULL, G_SPAWN_SEARCH_PATH, NULL, NULL, NULL, NULL);
+    run_command_with_progress("Compressing to ZIP...", cmd->str, "Archive operation completed");
     g_string_free(cmd, TRUE);
     g_free(archive_name);
     free_string_list(&sel);
@@ -1271,8 +1323,7 @@ static void on_menu_compress_tar(GtkMenuItem *item, gpointer data) {
         g_string_append(cmd, q_path);
         g_free(q_path);
     }
-    char *argv[] = { "/bin/sh", "-c", cmd->str, NULL };
-    g_spawn_async(app.current_dir, argv, NULL, G_SPAWN_SEARCH_PATH, NULL, NULL, NULL, NULL);
+    run_command_with_progress("Compressing to TAR.GZ...", cmd->str, "Archive operation completed");
     g_string_free(cmd, TRUE);
     g_free(archive_name);
     free_string_list(&sel);
@@ -1298,8 +1349,7 @@ static void on_menu_compress_7z(GtkMenuItem *item, gpointer data) {
         g_string_append(cmd, q_path);
         g_free(q_path);
     }
-    char *argv[] = { "/bin/sh", "-c", cmd->str, NULL };
-    g_spawn_async(app.current_dir, argv, NULL, G_SPAWN_SEARCH_PATH, NULL, NULL, NULL, NULL);
+    run_command_with_progress("Compressing to 7Z...", cmd->str, "Archive operation completed");
     g_string_free(cmd, TRUE);
     g_free(archive_name);
     free_string_list(&sel);
@@ -1328,8 +1378,7 @@ static void on_menu_extract_archive(GtkMenuItem *item, gpointer data) {
     }
     g_free(q_path);
 
-    char *argv[] = { "/bin/sh", "-c", cmd, NULL };
-    g_spawn_async(app.current_dir, argv, NULL, G_SPAWN_SEARCH_PATH, NULL, NULL, NULL, NULL);
+    run_command_with_progress("Extracting Archive...", cmd, "Archive extraction completed");
     free_string_list(&sel);
 }
 
@@ -1414,11 +1463,11 @@ static void on_menu_set_default_app(GtkMenuItem *item, gpointer data) {
         if (ct) {
             GList *apps = g_app_info_get_all_for_type(ct);
             if (apps) {
-                GtkWidget *dlg = gtk_dialog_new_with_buttons(
-                    "Set Default Application", GTK_WINDOW(app.window),
-                    GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
-                    "Cancel", GTK_RESPONSE_CANCEL,
-                    "Select", GTK_RESPONSE_ACCEPT, NULL);
+                GtkWidget *dlg = gtk_dialog_new();
+                gtk_window_set_transient_for(GTK_WINDOW(dlg), GTK_WINDOW(app.window));
+                gtk_window_set_modal(GTK_WINDOW(dlg), TRUE);
+                gtk_window_set_destroy_with_parent(GTK_WINDOW(dlg), TRUE);
+                gtk_window_set_title(GTK_WINDOW(dlg), "Set Default Application");
                 gtk_window_set_default_size(GTK_WINDOW(dlg), 350, 250);
 
                 GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dlg));
@@ -1439,6 +1488,17 @@ static void on_menu_set_default_app(GtkMenuItem *item, gpointer data) {
                     g_object_set_data(G_OBJECT(row), "appinfo", appinfo);
                     gtk_container_add(GTK_CONTAINER(list_box), row);
                 }
+
+                GtkWidget *btn_box = gtk_button_box_new(GTK_ORIENTATION_HORIZONTAL);
+                gtk_button_box_set_layout(GTK_BUTTON_BOX(btn_box), GTK_BUTTONBOX_END);
+                GtkWidget *btn_cancel = gtk_button_new_with_label("Cancel");
+                GtkWidget *btn_select = gtk_button_new_with_label("Select");
+                gtk_container_add(GTK_CONTAINER(btn_box), btn_cancel);
+                gtk_container_add(GTK_CONTAINER(btn_box), btn_select);
+                gtk_box_pack_start(GTK_BOX(content), btn_box, FALSE, FALSE, 0);
+
+                g_signal_connect_swapped(btn_cancel, "clicked", G_CALLBACK(gtk_widget_destroy), dlg);
+                g_signal_connect_swapped(btn_select, "clicked", G_CALLBACK(gtk_window_close), dlg);
 
                 gtk_widget_show_all(dlg);
                 if (gtk_dialog_run(GTK_DIALOG(dlg)) == GTK_RESPONSE_ACCEPT) {
@@ -1581,46 +1641,26 @@ static void execute_action(ActionId act) {
         }
         case ACT_PASTE: {
             if (!app.clipboard_paths) break;
+            GString *cmd = g_string_new(app.clipboard_is_cut ? "mv -f " : "cp -r ");
             int count = 0;
+            
             for (GList *l = app.clipboard_paths; l != NULL; l = l->next) {
-                const char *src_path = l->data;
-                char *base = g_path_get_basename(src_path);
-                char *dst_path = g_build_filename(app.current_dir, base ? base : "", NULL);
-
-                int idx = 1;
-                while (g_file_test(dst_path, G_FILE_TEST_EXISTS)) {
-                    g_free(dst_path);
-                    char *alt = g_strdup_printf("%s_copy%d", base ? base : "", idx++);
-                    dst_path = g_build_filename(app.current_dir, alt, NULL);
-                    g_free(alt);
-                }
-
-                GFile *f_src = g_file_new_for_path(src_path);
-                GFile *f_dst = g_file_new_for_path(dst_path);
-                GError *err = NULL;
-                gboolean ok = FALSE;
-
-                if (app.clipboard_is_cut) {
-                    ok = g_file_move(f_src, f_dst, G_FILE_COPY_NONE, NULL, NULL, NULL, &err);
-                    if (ok) push_undo(UNDO_MOVE, src_path, dst_path);
-                } else {
-                    ok = copy_recursive(f_src, f_dst, &err);
-                    if (ok) push_undo(UNDO_COPY, src_path, dst_path);
-                }
-
-                if (ok) count++;
-                else if (err) {
-                    set_status("Paste error: %s", err->message);
-                    g_error_free(err);
-                }
-
-                g_object_unref(f_src);
-                g_object_unref(f_dst);
-                g_free(dst_path);
-                g_free(base);
+                char *q_src = g_shell_quote((char *)l->data);
+                g_string_append_printf(cmd, "%s ", q_src);
+                g_free(q_src);
             }
-            if (app.clipboard_is_cut) free_string_list(&app.clipboard_paths);
-            if (count > 0) set_status("Pasted: %d items", count);
+            char *q_dst = g_shell_quote(app.current_dir);
+            g_string_append(cmd, q_dst);
+            g_free(q_dst);
+
+            char *success_msg = g_strdup_printf("%s: %d items", app.clipboard_is_cut ? "Moved" : "Pasted", g_list_length(app.clipboard_paths));
+            run_command_with_progress(app.clipboard_is_cut ? "Moving files..." : "Copying files...", cmd->str, success_msg);
+            
+            if (app.clipboard_is_cut) {
+                free_string_list(&app.clipboard_paths);
+            }
+            g_string_free(cmd, TRUE);
+            g_free(success_msg);
             break;
         }
         case ACT_UNDO:
@@ -2044,10 +2084,11 @@ static gboolean on_capture_key_press(GtkWidget *dlg, GdkEventKey *ev, gpointer u
 static void on_bind_button_clicked(GtkButton *btn, gpointer user_data) {
     BindButtonCtx *ctx = user_data;
     GtkWidget *top = gtk_widget_get_toplevel(GTK_WIDGET(btn));
-    GtkWidget *cap = gtk_dialog_new_with_buttons(
-        "Keybinding", GTK_WINDOW(top),
-        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
-        "Cancel", GTK_RESPONSE_CANCEL, NULL);
+    GtkWidget *cap = gtk_dialog_new();
+    gtk_window_set_transient_for(GTK_WINDOW(cap), GTK_WINDOW(top));
+    gtk_window_set_modal(GTK_WINDOW(cap), TRUE);
+    gtk_window_set_destroy_with_parent(GTK_WINDOW(cap), TRUE);
+    gtk_window_set_title(GTK_WINDOW(cap), "Keybinding");
 
     GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(cap));
     gtk_container_set_border_width(GTK_CONTAINER(area), 20);
@@ -2061,10 +2102,11 @@ static void on_bind_button_clicked(GtkButton *btn, gpointer user_data) {
 }
 
 static void open_settings_dialog(void) {
-    GtkWidget *dlg = gtk_dialog_new_with_buttons(
-        "Preferences", GTK_WINDOW(app.window),
-        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
-        "Close", GTK_RESPONSE_CLOSE, NULL);
+    GtkWidget *dlg = gtk_dialog_new();
+    gtk_window_set_transient_for(GTK_WINDOW(dlg), GTK_WINDOW(app.window));
+    gtk_window_set_modal(GTK_WINDOW(dlg), TRUE);
+    gtk_window_set_destroy_with_parent(GTK_WINDOW(dlg), TRUE);
+    gtk_window_set_title(GTK_WINDOW(dlg), "Preferences");
     gtk_window_set_default_size(GTK_WINDOW(dlg), 480, 560);
 
     GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dlg));
@@ -2162,10 +2204,11 @@ static void on_add_custom_action_clicked(GtkButton *btn, gpointer user_data) {
 }
 
 static void open_custom_actions_dialog(void) {
-    GtkWidget *dlg = gtk_dialog_new_with_buttons(
-        "Custom Actions Editor (Alt+,)", GTK_WINDOW(app.window),
-        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
-        "Close", GTK_RESPONSE_CLOSE, NULL);
+    GtkWidget *dlg = gtk_dialog_new();
+    gtk_window_set_transient_for(GTK_WINDOW(dlg), GTK_WINDOW(app.window));
+    gtk_window_set_modal(GTK_WINDOW(dlg), TRUE);
+    gtk_window_set_destroy_with_parent(GTK_WINDOW(dlg), TRUE);
+    gtk_window_set_title(GTK_WINDOW(dlg), "Custom Actions Editor (Alt+,)");
     gtk_window_set_default_size(GTK_WINDOW(dlg), 450, 400);
 
     GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dlg));
@@ -2867,7 +2910,9 @@ static void build_ui(void) {
 int main(int argc, char **argv) {
     gtk_init(&argc, &argv);
 
-    app.thread_pool = g_thread_pool_new(thumbnail_worker_thread, NULL, 4, FALSE, NULL);
+    int num_cores = g_get_num_processors();
+    int thread_count = (num_cores > 2) ? (num_cores > 8 ? 8 : num_cores) : 2;
+    app.thread_pool = g_thread_pool_new(thumbnail_worker_thread, NULL, thread_count, FALSE, NULL);
 
     GtkSettings *settings = gtk_settings_get_default();
     if (settings) {
