@@ -1184,6 +1184,43 @@ static void clipboard_clear_func(GtkClipboard *clipboard, gpointer user_data) {
     (void)clipboard; (void)user_data;
 }
 
+static GList *get_clipboard_paths_from_system(void) {
+    GtkClipboard *clip = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
+    GList *paths = NULL;
+    
+    GtkSelectionData *sdata = gtk_clipboard_wait_for_contents(clip, gdk_atom_intern("text/uri-list", FALSE));
+    if (sdata) {
+        gchar **uris = gtk_selection_data_get_uris(sdata);
+        if (uris) {
+            for (int i = 0; uris[i] != NULL; i++) {
+                char *path = g_filename_from_uri(uris[i], NULL, NULL);
+                if (path) {
+                    paths = g_list_append(paths, path);
+                }
+            }
+            g_strfreev(uris);
+        }
+        gtk_selection_data_free(sdata);
+    }
+
+    if (!paths) {
+        gchar *txt = gtk_clipboard_wait_for_text(clip);
+        if (txt) {
+            gchar **lines = g_strsplit(txt, "\n", -1);
+            for (int i = 0; lines[i] != NULL; i++) {
+                char *line = g_strstrip(lines[i]);
+                if (*line != '\0' && g_file_test(line, G_FILE_TEST_EXISTS)) {
+                    paths = g_list_append(paths, g_strdup(line));
+                }
+            }
+            g_strfreev(lines);
+            g_free(txt);
+        }
+    }
+
+    return paths;
+}
+
 static void switch_view_mode(ViewMode mode) {
     app.view_mode = mode;
     save_config();
@@ -1902,10 +1939,22 @@ static void execute_action(ActionId act) {
             break;
         }
         case ACT_PASTE: {
-            if (!app.clipboard_paths) break;
-            GString *cmd = g_string_new(app.clipboard_is_cut ? "mv -f " : "cp -r ");
+            GList *paths_to_paste = app.clipboard_paths;
+            gboolean is_cut = app.clipboard_is_cut;
+
+            if (!paths_to_paste) {
+                paths_to_paste = get_clipboard_paths_from_system();
+                is_cut = FALSE;
+            }
+
+            if (!paths_to_paste) {
+                set_status("Nothing to paste");
+                break;
+            }
+
+            GString *cmd = g_string_new(is_cut ? "mv -f " : "cp -r ");
             
-            for (GList *l = app.clipboard_paths; l != NULL; l = l->next) {
+            for (GList *l = paths_to_paste; l != NULL; l = l->next) {
                 char *q_src = g_shell_quote((char *)l->data);
                 g_string_append_printf(cmd, "%s ", q_src);
                 g_free(q_src);
@@ -1914,12 +1963,17 @@ static void execute_action(ActionId act) {
             g_string_append(cmd, q_dst);
             g_free(q_dst);
 
-            char *success_msg = g_strdup_printf("%s: %d items", app.clipboard_is_cut ? "Moved" : "Pasted", g_list_length(app.clipboard_paths));
-            run_command_with_progress(app.clipboard_is_cut ? "Moving files..." : "Copying files...", cmd->str, success_msg);
+            char *success_msg = g_strdup_printf("%s: %d items", is_cut ? "Moved" : "Pasted", g_list_length(paths_to_paste));
+            run_command_with_progress(is_cut ? "Moving files..." : "Copying files...", cmd->str, success_msg);
             
-            if (app.clipboard_is_cut) {
+            if (is_cut && app.clipboard_paths) {
                 free_string_list(&app.clipboard_paths);
             }
+
+            if (paths_to_paste != app.clipboard_paths) {
+                free_string_list(&paths_to_paste);
+            }
+
             g_string_free(cmd, TRUE);
             g_free(success_msg);
             break;
@@ -2123,17 +2177,17 @@ static gboolean handle_context_menu(GdkEventButton *ev, gboolean is_row) {
 
             free_string_list(&sel);
 
-            item = gtk_menu_item_new_with_label("Rename (Ctrl+3)");
+            item = gtk_menu_item_new_with_label("Rename");
             g_signal_connect(item, "activate", G_CALLBACK(on_menu_rename), NULL);
             gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
 
             gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
 
-            item = gtk_menu_item_new_with_label("Copy (Ctrl+C)");
+            item = gtk_menu_item_new_with_label("Copy");
             g_signal_connect(item, "activate", G_CALLBACK(on_menu_copy), NULL);
             gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
 
-            item = gtk_menu_item_new_with_label("Cut (Ctrl+X)");
+            item = gtk_menu_item_new_with_label("Cut");
             g_signal_connect(item, "activate", G_CALLBACK(on_menu_cut), NULL);
             gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
 
@@ -2162,7 +2216,6 @@ static gboolean handle_context_menu(GdkEventButton *ev, gboolean is_row) {
 
             item = gtk_menu_item_new_with_label("Paste");
             g_signal_connect(item, "activate", G_CALLBACK(on_menu_paste), NULL);
-            gtk_widget_set_sensitive(item, app.clipboard_paths != NULL);
             gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
 
             gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
@@ -2187,11 +2240,11 @@ static gboolean handle_context_menu(GdkEventButton *ev, gboolean is_row) {
         gtk_menu_shell_append(GTK_MENU_SHELL(menu), sort_item);
         gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
 
-        item = gtk_menu_item_new_with_label("View as List (Ctrl+1)");
+        item = gtk_menu_item_new_with_label("View as List");
         g_signal_connect(item, "activate", G_CALLBACK(on_menu_view_list), NULL);
         gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
 
-        item = gtk_menu_item_new_with_label("View as Icons (Ctrl+2)");
+        item = gtk_menu_item_new_with_label("View as Icons");
         g_signal_connect(item, "activate", G_CALLBACK(on_menu_view_icons), NULL);
         gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
 
@@ -2203,7 +2256,7 @@ static gboolean handle_context_menu(GdkEventButton *ev, gboolean is_row) {
             gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
         }
 
-        item = gtk_menu_item_new_with_label("Refresh (Ctrl+R)");
+        item = gtk_menu_item_new_with_label("Refresh");
         g_signal_connect(item, "activate", G_CALLBACK(on_menu_refresh), NULL);
         gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
 
@@ -2212,7 +2265,7 @@ static gboolean handle_context_menu(GdkEventButton *ev, gboolean is_row) {
             g_signal_connect(item, "activate", G_CALLBACK(on_menu_settings), NULL);
             gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
 
-            item = gtk_menu_item_new_with_label("Custom Actions Editor (Alt+,)");
+            item = gtk_menu_item_new_with_label("Custom Actions Editor");
             g_signal_connect(item, "activate", G_CALLBACK(open_custom_actions_dialog), NULL);
             gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
         }
@@ -2449,7 +2502,7 @@ static void open_custom_actions_dialog(void) {
     gtk_window_set_transient_for(GTK_WINDOW(dlg), GTK_WINDOW(app.window));
     gtk_window_set_modal(GTK_WINDOW(dlg), TRUE);
     gtk_window_set_destroy_with_parent(GTK_WINDOW(dlg), TRUE);
-    gtk_window_set_title(GTK_WINDOW(dlg), "Custom Actions Editor (Alt+,)");
+    gtk_window_set_title(GTK_WINDOW(dlg), "Custom Actions Editor");
     gtk_window_set_default_size(GTK_WINDOW(dlg), 450, 400);
 
     GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dlg));
@@ -3178,7 +3231,7 @@ static void build_ui(void) {
         gtk_widget_grab_focus(app.icon_view);
     } else {
         gtk_stack_set_visible_child_name(GTK_STACK(app.content_stack), "list");
-        gtk_widget_grab_focus(app.tree_view);
+        gtk_widget_grab_focus(app.tree_view); // <--- Исправлено здесь
     }
     
     refresh_dir();
