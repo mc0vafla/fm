@@ -155,6 +155,11 @@ static void unpin_path_from_bookmarks(const char *path);
 static gboolean is_path_in_gtk_bookmarks(const char *path);
 static void add_sidebar_item(const char *label, const char *path, const char *icon_name, gboolean is_trash, gboolean is_mount, GMount *mount);
 static GdkPixbuf *get_fast_file_icon(gboolean is_dir, const char *name, int size);
+static void push_undo(UndoType type, const char *src, const char *dst);
+static void on_view_drag_data_received(GtkWidget *widget, GdkDragContext *context, gint x, gint y, GtkSelectionData *selection_data, guint info, guint time, gpointer user_data);
+static gboolean handle_context_menu(GdkEventButton *ev, gboolean is_row);
+static void go_back(void);
+static void go_forward(void);
 
 typedef struct {
     GtkWidget *dialog;
@@ -256,6 +261,7 @@ static GList *get_selected_paths(void) {
         if (!app.tree_view) return NULL;
         GtkTreeSelection *sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(app.tree_view));
         if (!sel) return NULL;
+        
         GtkTreeModel *model = NULL;
         GList *rows = gtk_tree_selection_get_selected_rows(sel, &model);
         if (!rows || !model) {
@@ -273,8 +279,16 @@ static GList *get_selected_paths(void) {
         g_list_free_full(rows, (GDestroyNotify)gtk_tree_path_free);
     } else {
         if (!app.icon_view) return NULL;
-        GList *items = gtk_icon_view_get_selected_items(GTK_ICON_VIEW(app.icon_view));
-        GtkTreeModel *model = gtk_icon_view_get_model(GTK_ICON_VIEW(app.icon_view));
+        GtkIconView *iv = GTK_ICON_VIEW(app.icon_view);
+        GList *items = gtk_icon_view_get_selected_items(iv);
+        if (!items) return NULL; 
+
+        GtkTreeModel *model = gtk_icon_view_get_model(iv);
+        if (!model) {
+            g_list_free_full(items, (GDestroyNotify)gtk_tree_path_free);
+            return NULL;
+        }
+
         for (GList *l = items; l != NULL; l = l->next) {
             GtkTreeIter iter;
             if (gtk_tree_model_get_iter(model, &iter, l->data)) {
@@ -1040,6 +1054,259 @@ static void go_forward(void) {
     app.history_back = g_list_prepend(app.history_back, g_strdup(app.current_dir));
     navigate_to(next, FALSE);
     g_free(next);
+}
+
+static int process_file_operation(const char *src_path, const char *dest_dir, gboolean is_move) {
+    char *basename = g_path_get_basename(src_path);
+    char *dest_path = g_build_filename(dest_dir, basename, NULL);
+
+    if (g_strcmp0(src_path, dest_path) == 0) {
+        g_free(basename);
+        g_free(dest_path);
+        return 0; 
+    }
+
+    gboolean skip = FALSE;
+    if (g_file_test(dest_path, G_FILE_TEST_EXISTS)) {
+        GtkWidget *dialog = gtk_message_dialog_new(
+            GTK_WINDOW(app.window),
+            GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+            GTK_MESSAGE_QUESTION,
+            GTK_BUTTONS_NONE,
+            "File already exists: %s", basename
+        );
+        gtk_message_dialog_format_secondary_text(
+            GTK_MESSAGE_DIALOG(dialog),
+            "A file with the same name already exists in this folder. Do you want to overwrite it or skip?"
+        );
+        gtk_dialog_add_button(GTK_DIALOG(dialog), "Skip", GTK_RESPONSE_NO);
+        gtk_dialog_add_button(GTK_DIALOG(dialog), "Overwrite", GTK_RESPONSE_YES);
+
+        int response = gtk_dialog_run(GTK_DIALOG(dialog));
+        gtk_widget_destroy(dialog);
+
+        if (response != GTK_RESPONSE_YES) {
+            skip = TRUE;
+        }
+    }
+
+    int success = 0;
+    if (!skip) {
+        GFile *f_src = g_file_new_for_path(src_path);
+        GFile *f_dst = g_file_new_for_path(dest_path);
+        GError *err = NULL;
+        gboolean res = FALSE;
+
+        if (is_move) {
+            res = g_file_move(f_src, f_dst, G_FILE_COPY_OVERWRITE, NULL, NULL, NULL, &err);
+        } else {
+            res = g_file_copy(f_src, f_dst, G_FILE_COPY_OVERWRITE, NULL, NULL, NULL, &err);
+        }
+
+        if (res) {
+            success = 1;
+        } else {
+            if (err) {
+                set_status("Error: %s", err->message);
+                g_error_free(err);
+            }
+        }
+
+        g_object_unref(f_src);
+        g_object_unref(f_dst);
+    }
+
+    g_free(basename);
+    g_free(dest_path);
+    return success;
+}
+
+static void on_view_drag_data_received(GtkWidget *widget, GdkDragContext *context, gint x, gint y, GtkSelectionData *selection_data, guint info, guint time, gpointer user_data) {
+    (void)widget; (void)info; (void)time; (void)user_data;
+    const guchar *data = gtk_selection_data_get_data(selection_data);
+    if (!data || *data == '\0') {
+        gdk_drag_status(context, 0, time);
+        gtk_drag_finish(context, FALSE, FALSE, time);
+        return;
+    }
+
+    gchar **uris = gtk_selection_data_get_uris(selection_data);
+    if (!uris) {
+        gtk_drag_finish(context, FALSE, FALSE, time);
+        return;
+    }
+
+    char *dest_dir = g_strdup(app.current_dir);
+    if (app.view_mode == VIEW_MODE_LIST) {
+        GtkTreePath *path = NULL;
+        GtkTreeView *tv = GTK_TREE_VIEW(app.tree_view);
+        if (gtk_tree_view_get_path_at_pos(tv, x, y, &path, NULL, NULL, NULL)) {
+            GtkTreeModel *model = GTK_TREE_MODEL(app.list_store);
+            GtkTreeIter iter;
+            if (gtk_tree_model_get_iter(model, &iter, path)) {
+                gboolean is_dir = FALSE;
+                char *fpath = NULL;
+                gtk_tree_model_get(model, &iter, COL_IS_DIR, &is_dir, COL_FULL_PATH, &fpath, -1);
+                if (is_dir && fpath) {
+                    g_free(dest_dir);
+                    dest_dir = g_strdup(fpath);
+                }
+                g_free(fpath);
+            }
+            gtk_tree_path_free(path);
+        }
+    } else {
+        GtkTreePath *path = gtk_icon_view_get_path_at_pos(GTK_ICON_VIEW(app.icon_view), x, y);
+        if (path) {
+            GtkTreeModel *model = GTK_TREE_MODEL(app.list_store);
+            GtkTreeIter iter;
+            if (gtk_tree_model_get_iter(model, &iter, path)) {
+                gboolean is_dir = FALSE;
+                char *fpath = NULL;
+                gtk_tree_model_get(model, &iter, COL_IS_DIR, &is_dir, COL_FULL_PATH, &fpath, -1);
+                if (is_dir && fpath) {
+                    g_free(dest_dir);
+                    dest_dir = g_strdup(fpath);
+                }
+                g_free(fpath);
+            }
+            gtk_tree_path_free(path);
+        }
+    }
+
+    GdkDragAction action = gdk_drag_context_get_selected_action(context);
+    gboolean is_move = (action == GDK_ACTION_MOVE);
+
+    int success_count = 0;
+    for (int i = 0; uris[i] != NULL; i++) {
+        char *src_path = g_filename_from_uri(uris[i], NULL, NULL);
+        if (!src_path) continue;
+
+        success_count += process_file_operation(src_path, dest_dir, is_move);
+        g_free(src_path);
+    }
+
+    if (success_count > 0) {
+        refresh_dir();
+        set_status("%s %d items successfully", is_move ? "Moved" : "Copied", success_count);
+        gtk_drag_finish(context, TRUE, is_move, time);
+    } else {
+        gtk_drag_finish(context, FALSE, FALSE, time);
+    }
+
+    g_strfreev(uris);
+    g_free(dest_dir);
+}
+
+typedef struct {
+    gdouble start_x;
+    gdouble start_y;
+    gboolean dragging_active;
+} DragState;
+
+static DragState drag_state = {0};
+
+static gboolean on_view_button_press(GtkWidget *widget, GdkEventButton *ev, gpointer data) {
+    (void)data;
+    if (ev->button == 8) {
+        go_back();
+        return TRUE;
+    }
+    if (ev->button == 9) {
+        go_forward();
+        return TRUE;
+    }
+
+    if (ev->button == GDK_BUTTON_PRIMARY && ev->type == GDK_BUTTON_PRESS) {
+        drag_state.start_x = ev->x;
+        drag_state.start_y = ev->y;
+        drag_state.dragging_active = FALSE;
+    }
+    
+    if (ev->type == GDK_BUTTON_PRESS && ev->button == 3) {
+        if (GTK_IS_TREE_VIEW(widget)) {
+            GtkTreePath *path = NULL;
+            GtkTreeView *tv = GTK_TREE_VIEW(widget);
+            gboolean clicked_on_row = gtk_tree_view_get_path_at_pos(tv, (gint)ev->x, (gint)ev->y, &path, NULL, NULL, NULL);
+            if (clicked_on_row) {
+                GtkTreeSelection *sel = gtk_tree_view_get_selection(tv);
+                if (!gtk_tree_selection_path_is_selected(sel, path)) {
+                    gtk_tree_selection_unselect_all(sel);
+                    gtk_tree_selection_select_path(sel, path);
+                }
+                gtk_tree_path_free(path);
+                return handle_context_menu(ev, TRUE);
+            } else {
+                if (path) gtk_tree_path_free(path);
+                return handle_context_menu(ev, FALSE);
+            }
+        } else if (GTK_IS_ICON_VIEW(widget)) {
+            GtkTreePath *path = gtk_icon_view_get_path_at_pos(GTK_ICON_VIEW(widget), (gint)ev->x, (gint)ev->y);
+            if (path) {
+                GtkIconView *iv = GTK_ICON_VIEW(widget);
+                if (!gtk_icon_view_path_is_selected(iv, path)) {
+                    gtk_icon_view_unselect_all(iv);
+                    gtk_icon_view_select_path(iv, path);
+                }
+                gtk_tree_path_free(path);
+                return handle_context_menu(ev, TRUE);
+            } else {
+                return handle_context_menu(ev, FALSE);
+            }
+        }
+    }
+    
+    return FALSE; 
+}
+
+static gboolean on_view_motion_notify(GtkWidget *widget, GdkEventMotion *ev, gpointer data) {
+    (void)data;
+    if ((ev->state & GDK_BUTTON1_MASK) && (ev->state & GDK_MOD1_MASK)) {
+        if (!drag_state.dragging_active) {
+            if (gtk_drag_check_threshold(widget, (gint)drag_state.start_x, (gint)drag_state.start_y, (gint)ev->x, (gint)ev->y)) {
+                drag_state.dragging_active = TRUE;
+
+                GtkTargetList *targets = gtk_target_list_new(NULL, 0);
+                gtk_target_list_add_uri_targets(targets, 0);
+
+                gtk_drag_begin_with_coordinates(
+                    widget, targets, 
+                    GDK_ACTION_COPY | GDK_ACTION_MOVE, 
+                    1, (GdkEvent *)ev, 
+                    (gint)ev->x, (gint)ev->y
+                );
+
+                gtk_target_list_unref(targets);
+            }
+        }
+    }
+    return FALSE;
+}
+
+static gboolean on_view_button_release(GtkWidget *widget, GdkEventButton *ev, gpointer data) {
+    (void)widget; (void)data;
+    if (ev->button == GDK_BUTTON_PRIMARY) {
+        drag_state.dragging_active = FALSE;
+    }
+    return FALSE;
+}
+
+static void on_view_drag_data_get(GtkWidget *widget, GdkDragContext *context, GtkSelectionData *selection_data, guint info, guint time, gpointer user_data) {
+    (void)widget; (void)context; (void)info; (void)time; (void)user_data;
+    GList *sel = get_selected_paths();
+    if (!sel) return;
+
+    GString *uri_list = g_string_new(NULL);
+    for (GList *l = sel; l != NULL; l = l->next) {
+        char *uri = g_filename_to_uri((const char *)l->data, NULL, NULL);
+        if (uri) {
+            g_string_append_printf(uri_list, "%s\r\n", uri);
+            g_free(uri);
+        }
+    }
+    gtk_selection_data_set(selection_data, gtk_selection_data_get_target(selection_data), 8, (const guchar *)uri_list->str, (gint)uri_list->len);
+    g_string_free(uri_list, TRUE);
+    free_string_list(&sel);
 }
 
 static char *prompt_text(const char *title, const char *label_txt, const char *initial) {
@@ -1952,30 +2219,25 @@ static void execute_action(ActionId act) {
                 break;
             }
 
-            GString *cmd = g_string_new(is_cut ? "mv -f " : "cp -r ");
-            
+            int success_count = 0;
             for (GList *l = paths_to_paste; l != NULL; l = l->next) {
-                char *q_src = g_shell_quote((char *)l->data);
-                g_string_append_printf(cmd, "%s ", q_src);
-                g_free(q_src);
+                char *src_path = (char *)l->data;
+                success_count += process_file_operation(src_path, app.current_dir, is_cut);
             }
-            char *q_dst = g_shell_quote(app.current_dir);
-            g_string_append(cmd, q_dst);
-            g_free(q_dst);
 
-            char *success_msg = g_strdup_printf("%s: %d items", is_cut ? "Moved" : "Pasted", g_list_length(paths_to_paste));
-            run_command_with_progress(is_cut ? "Moving files..." : "Copying files...", cmd->str, success_msg);
-            
+            if (success_count > 0) {
+                refresh_dir();
+                set_status("%s %d items successfully", is_cut ? "Moved" : "Pasted", success_count);
+            }
+
             if (is_cut && app.clipboard_paths) {
                 free_string_list(&app.clipboard_paths);
+                app.clipboard_is_cut = FALSE;
             }
 
             if (paths_to_paste != app.clipboard_paths) {
                 free_string_list(&paths_to_paste);
             }
-
-            g_string_free(cmd, TRUE);
-            g_free(success_msg);
             break;
         }
         case ACT_UNDO:
@@ -2192,9 +2454,6 @@ static gboolean handle_context_menu(GdkEventButton *ev, gboolean is_row) {
             gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
 
             gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
-
-
-            gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
             item = gtk_menu_item_new_with_label("Properties...");
             g_signal_connect(item, "activate", G_CALLBACK(on_menu_properties), NULL);
             gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
@@ -2274,57 +2533,6 @@ static gboolean handle_context_menu(GdkEventButton *ev, gboolean is_row) {
     gtk_widget_show_all(menu);
     gtk_menu_popup_at_pointer(GTK_MENU(menu), (GdkEvent *)ev);
     return TRUE;
-}
-
-static gboolean on_tree_view_button_press(GtkWidget *widget, GdkEventButton *ev, gpointer data) {
-    (void)data;
-    if (ev->type == GDK_BUTTON_PRESS) {
-        if (ev->button == 8) { go_back(); return TRUE; }
-        else if (ev->button == 9) { go_forward(); return TRUE; }
-    }
-
-    if (ev->type == GDK_BUTTON_PRESS && ev->button == 3) {
-        GtkTreePath *path = NULL;
-        GtkTreeView *tv = GTK_TREE_VIEW(widget);
-        gboolean clicked_on_row = gtk_tree_view_get_path_at_pos(tv, (gint)ev->x, (gint)ev->y, &path, NULL, NULL, NULL);
-        if (clicked_on_row) {
-            GtkTreeSelection *sel = gtk_tree_view_get_selection(tv);
-            if (!gtk_tree_selection_path_is_selected(sel, path)) {
-                gtk_tree_selection_unselect_all(sel);
-                gtk_tree_selection_select_path(sel, path);
-            }
-            gtk_tree_path_free(path);
-            return handle_context_menu(ev, TRUE);
-        } else {
-            if (path) gtk_tree_path_free(path);
-            return handle_context_menu(ev, FALSE);
-        }
-    }
-    return FALSE;
-}
-
-static gboolean on_icon_view_button_press(GtkWidget *widget, GdkEventButton *ev, gpointer data) {
-    (void)data;
-    if (ev->type == GDK_BUTTON_PRESS) {
-        if (ev->button == 8) { go_back(); return TRUE; }
-        else if (ev->button == 9) { go_forward(); return TRUE; }
-    }
-
-    if (ev->type == GDK_BUTTON_PRESS && ev->button == 3) {
-        GtkTreePath *path = gtk_icon_view_get_path_at_pos(GTK_ICON_VIEW(widget), (gint)ev->x, (gint)ev->y);
-        if (path) {
-            GtkIconView *iv = GTK_ICON_VIEW(widget);
-            if (!gtk_icon_view_path_is_selected(iv, path)) {
-                gtk_icon_view_unselect_all(iv);
-                gtk_icon_view_select_path(iv, path);
-            }
-            gtk_tree_path_free(path);
-            return handle_context_menu(ev, TRUE);
-        } else {
-            return handle_context_menu(ev, FALSE);
-        }
-    }
-    return FALSE;
 }
 
 static gboolean on_view_scroll_event(GtkWidget *widget, GdkEventScroll *ev, gpointer data) {
@@ -3146,7 +3354,6 @@ static void build_ui(void) {
     g_signal_connect_swapped(tree_sel, "changed", G_CALLBACK(on_selection_changed), NULL);
     gtk_tree_view_set_search_column(GTK_TREE_VIEW(app.tree_view), COL_NAME);
     g_signal_connect(app.tree_view, "row-activated", G_CALLBACK(on_row_activated), NULL);
-    g_signal_connect(app.tree_view, "button-press-event", G_CALLBACK(on_tree_view_button_press), NULL);
 
     GtkCellRenderer *icon_r = gtk_cell_renderer_pixbuf_new();
     GtkCellRenderer *name_r = gtk_cell_renderer_text_new();
@@ -3194,8 +3401,31 @@ static void build_ui(void) {
 
     g_signal_connect_swapped(app.icon_view, "selection-changed", G_CALLBACK(on_selection_changed), NULL);
     g_signal_connect(app.icon_view, "item-activated", G_CALLBACK(on_icon_activated), NULL);
-    g_signal_connect(app.icon_view, "button-press-event", G_CALLBACK(on_icon_view_button_press), NULL);
     g_signal_connect(app.icon_view, "scroll-event", G_CALLBACK(on_view_scroll_event), NULL);
+
+    {
+        static GtkTargetEntry drag_targets[] = {
+            { (gchar *)"text/uri-list", 0, 0 }
+        };
+
+        gtk_drag_dest_set(app.tree_view, GTK_DEST_DEFAULT_ALL, drag_targets, 1, GDK_ACTION_COPY | GDK_ACTION_MOVE);
+        g_signal_connect(app.tree_view, "drag-data-received", G_CALLBACK(on_view_drag_data_received), NULL);
+
+        gtk_drag_dest_set(app.icon_view, GTK_DEST_DEFAULT_ALL, drag_targets, 1, GDK_ACTION_COPY | GDK_ACTION_MOVE);
+        g_signal_connect(app.icon_view, "drag-data-received", G_CALLBACK(on_view_drag_data_received), NULL);
+
+        gtk_widget_add_events(app.tree_view, GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK | GDK_POINTER_MOTION_MASK);
+        g_signal_connect(app.tree_view, "button-press-event", G_CALLBACK(on_view_button_press), NULL);
+        g_signal_connect(app.tree_view, "motion-notify-event", G_CALLBACK(on_view_motion_notify), NULL);
+        g_signal_connect(app.tree_view, "button-release-event", G_CALLBACK(on_view_button_release), NULL);
+        g_signal_connect(app.tree_view, "drag-data-get", G_CALLBACK(on_view_drag_data_get), NULL);
+
+        gtk_widget_add_events(app.icon_view, GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK | GDK_POINTER_MOTION_MASK);
+        g_signal_connect(app.icon_view, "button-press-event", G_CALLBACK(on_view_button_press), NULL);
+        g_signal_connect(app.icon_view, "motion-notify-event", G_CALLBACK(on_view_motion_notify), NULL);
+        g_signal_connect(app.icon_view, "button-release-event", G_CALLBACK(on_view_button_release), NULL);
+        g_signal_connect(app.icon_view, "drag-data-get", G_CALLBACK(on_view_drag_data_get), NULL);
+    }
 
     GtkWidget *icon_scroll = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(icon_scroll), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
