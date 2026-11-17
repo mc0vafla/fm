@@ -1046,6 +1046,25 @@ static void clipboard_clear_func(GtkClipboard *clipboard, gpointer user_data) {
     (void)clipboard; (void)user_data;
 }
 
+/* --- Drag and Drop Source Callbacks --- */
+static void on_drag_data_get(GtkWidget *widget, GdkDragContext *context, GtkSelectionData *selection_data, guint info, guint time, gpointer user_data) {
+    (void)widget; (void)context; (void)info; (void)time; (void)user_data;
+    GList *sel = get_selected_paths();
+    if (!sel) return;
+
+    GString *uri_list = g_string_new(NULL);
+    for (GList *l = sel; l != NULL; l = l->next) {
+        char *uri = g_filename_to_uri((const char *)l->data, NULL, NULL);
+        if (uri) {
+            g_string_append_printf(uri_list, "%s\r\n", uri);
+            g_free(uri);
+        }
+    }
+    gtk_selection_data_set(selection_data, gtk_selection_data_get_target(selection_data), 8, (const guchar *)uri_list->str, (gint)uri_list->len);
+    g_string_free(uri_list, TRUE);
+    free_string_list(&sel);
+}
+
 static void switch_view_mode(ViewMode mode) {
     app.view_mode = mode;
     save_config();
@@ -2765,6 +2784,18 @@ static void build_ui(void) {
     g_signal_connect(app.icon_view, "item-activated", G_CALLBACK(on_icon_activated), NULL);
     g_signal_connect(app.icon_view, "button-press-event", G_CALLBACK(on_icon_view_button_press), NULL);
     g_signal_connect(app.icon_view, "scroll-event", G_CALLBACK(on_view_scroll_event), NULL);
+
+    /* --- Настройка Drag and Drop Source для TreeView и IconView --- */
+    {
+        static GtkTargetEntry drag_targets[] = {
+            { (gchar *) "text/uri-list", 0, 0 }
+        };
+        gtk_drag_source_set(app.tree_view, GDK_BUTTON1_MASK, drag_targets, 1, GDK_ACTION_COPY | GDK_ACTION_MOVE);
+        g_signal_connect(app.tree_view, "drag-data-get", G_CALLBACK(on_drag_data_get), NULL);
+
+        gtk_drag_source_set(app.icon_view, GDK_BUTTON1_MASK, drag_targets, 1, GDK_ACTION_COPY | GDK_ACTION_MOVE);
+        g_signal_connect(app.icon_view, "drag-data-get", G_CALLBACK(on_drag_data_get), NULL);
+    }
 
     GtkWidget *icon_scroll = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(icon_scroll), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
