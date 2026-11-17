@@ -285,7 +285,7 @@ static GList *get_selected_paths(void) {
 
 static void update_status_bar_info(void) {
     if (app.search_query[0] != '\0') {
-        set_status_markup("Search: <span foreground=\"#e5c07b\" font_weight=\"bold\"><b>%s</b></span>", app.search_query);
+        set_status_markup("Search: <span foreground=\"#D35856\" font_weight=\"bold\"><b>%s</b></span>", app.search_query);
         return;
     }
 
@@ -468,18 +468,65 @@ static GdkPixbuf *get_heavy_thumbnail(const char *full_path, int size) {
         g_checksum_update(checksum, (const guchar *)uri, strlen(uri));
         const char *hash = g_checksum_get_string(checksum);
         char *hash_filename = g_strconcat(hash, ".png", NULL);
-        char *thumb_path = g_build_filename(g_get_user_cache_dir(), "thumbnails", "normal", hash_filename, NULL);
         
-        if (g_file_test(thumb_path, G_FILE_TEST_EXISTS)) {
-            pix = gdk_pixbuf_new_from_file_at_scale(thumb_path, size, size, TRUE, NULL);
+        char *thumb_path_normal = g_build_filename(g_get_user_cache_dir(), "thumbnails", "normal", hash_filename, NULL);
+        char *thumb_path_large = g_build_filename(g_get_user_cache_dir(), "thumbnails", "large", hash_filename, NULL);
+        
+        if (g_file_test(thumb_path_large, G_FILE_TEST_EXISTS) && size > 128) {
+            pix = gdk_pixbuf_new_from_file_at_scale(thumb_path_large, size, size, TRUE, NULL);
         }
-        g_free(thumb_path);
+        if (!pix && g_file_test(thumb_path_normal, G_FILE_TEST_EXISTS)) {
+            pix = gdk_pixbuf_new_from_file_at_scale(thumb_path_normal, size, size, TRUE, NULL);
+        }
+
+        if (!pix) {
+            const char *ext = strrchr(full_path, '.');
+            gboolean is_mp3 = ext && (g_ascii_strcasecmp(ext, ".mp3") == 0 || g_ascii_strcasecmp(ext, ".flac") == 0);
+            gboolean is_video = ext && (g_ascii_strcasecmp(ext, ".mp4") == 0 || 
+                                       g_ascii_strcasecmp(ext, ".mkv") == 0 || 
+                                       g_ascii_strcasecmp(ext, ".avi") == 0 || 
+                                       g_ascii_strcasecmp(ext, ".webm") == 0 || 
+                                       g_ascii_strcasecmp(ext, ".mov") == 0);
+
+            char *tmp_img = g_strdup_printf("/tmp/fm_cover_%u.jpg", g_random_int());
+            char *cmd = NULL;
+
+            if (is_mp3) {
+                cmd = g_strdup_printf("ffmpeg -y -i %s -an -vcodec copy %s 2>/dev/null", 
+                                            g_shell_quote(full_path), 
+                                            g_shell_quote(tmp_img));
+            } else if (is_video) {
+                cmd = g_strdup_printf("ffmpeg -y -ss 00:00:02 -i %s -vframes 1 %s 2>/dev/null", 
+                                            g_shell_quote(full_path), 
+                                            g_shell_quote(tmp_img));
+            }
+
+            if (cmd) {
+                if (system(cmd) == 0 && g_file_test(tmp_img, G_FILE_TEST_EXISTS)) {
+                    pix = gdk_pixbuf_new_from_file_at_scale(tmp_img, size, size, TRUE, NULL);
+                }
+                unlink(tmp_img);
+                g_free(cmd);
+            }
+            g_free(tmp_img);
+
+            if (!pix) {
+                pix = gdk_pixbuf_new_from_file_at_scale(full_path, size, size, TRUE, NULL);
+            }
+            
+            if (pix) {
+                char *normal_dir = g_build_filename(g_get_user_cache_dir(), "thumbnails", "normal", NULL);
+                g_mkdir_with_parents(normal_dir, 0755);
+                gdk_pixbuf_save(pix, thumb_path_normal, "png", NULL, NULL);
+                g_free(normal_dir);
+            }
+        }
+
+        g_free(thumb_path_normal);
+        g_free(thumb_path_large);
         g_free(hash_filename);
         g_checksum_free(checksum);
         g_free(uri);
-    }
-    if (!pix) {
-        pix = gdk_pixbuf_new_from_file_at_scale(full_path, size, size, TRUE, NULL);
     }
     return pix;
 }
@@ -872,22 +919,16 @@ static void refresh_dir(void) {
                            COL_IS_DIR, is_dir,
                            COL_FULL_PATH, full_path, -1);
         
-        const char *ext = name ? strrchr(name, '.') : NULL;
-        gboolean is_image = !is_dir && ext && (
-            g_ascii_strcasecmp(ext, ".png") == 0 || g_ascii_strcasecmp(ext, ".jpg") == 0 ||
-            g_ascii_strcasecmp(ext, ".jpeg") == 0 || g_ascii_strcasecmp(ext, ".gif") == 0 ||
-            g_ascii_strcasecmp(ext, ".webp") == 0 || g_ascii_strcasecmp(ext, ".bmp") == 0 ||
-            g_ascii_strcasecmp(ext, ".svg") == 0 || g_ascii_strcasecmp(ext, ".svgz") == 0
-        );
+        gboolean can_have_thumbnail = !is_dir;
 
-        if (is_image) {
+        if (can_have_thumbnail) {
             GtkTreePath *tree_path = gtk_tree_model_get_path(GTK_TREE_MODEL(app.list_store), &iter);
             if (tree_path) {
                 GtkTreeRowReference *row_ref = gtk_tree_row_reference_new(GTK_TREE_MODEL(app.list_store), tree_path);
                 gtk_tree_path_free(tree_path);
 
                 ThumbnailTask *task = g_new0(ThumbnailTask, 1);
-                task->full_path = g_strdup(full_path);
+                task->full_path = g_build_filename(app.current_dir, name ? name : "", NULL);
                 task->icon_size = current_icon_size;
                 task->gen_id = app.generation_id;
                 task->row_ref = row_ref;
@@ -1642,7 +1683,6 @@ static void execute_action(ActionId act) {
         case ACT_PASTE: {
             if (!app.clipboard_paths) break;
             GString *cmd = g_string_new(app.clipboard_is_cut ? "mv -f " : "cp -r ");
-            int count = 0;
             
             for (GList *l = app.clipboard_paths; l != NULL; l = l->next) {
                 char *q_src = g_shell_quote((char *)l->data);
@@ -2695,15 +2735,17 @@ static void process_quick_search_input(guint keyval) {
         valid = gtk_tree_model_iter_next(model, &iter);
     }
 
-    if (best_path && best_score > 0) {
+if (best_path && best_score > 0) {
         if (app.view_mode == VIEW_MODE_LIST) {
             GtkTreeSelection *sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(app.tree_view));
             gtk_tree_selection_unselect_all(sel);
             gtk_tree_selection_select_path(sel, best_path);
+            gtk_tree_view_set_cursor(GTK_TREE_VIEW(app.tree_view), best_path, NULL, FALSE);
             gtk_tree_view_scroll_to_cell(GTK_TREE_VIEW(app.tree_view), best_path, NULL, FALSE, 0, 0);
         } else {
             gtk_icon_view_unselect_all(GTK_ICON_VIEW(app.icon_view));
             gtk_icon_view_select_path(GTK_ICON_VIEW(app.icon_view), best_path);
+            gtk_icon_view_set_cursor(GTK_ICON_VIEW(app.icon_view), best_path, NULL, FALSE);
             gtk_icon_view_scroll_to_path(GTK_ICON_VIEW(app.icon_view), best_path, FALSE, 0, 0);
         }
         gtk_tree_path_free(best_path);
@@ -2740,6 +2782,43 @@ static gboolean on_main_key_press(GtkWidget *w, GdkEventKey *ev, gpointer data) 
         }
     }
 
+    if (ev->keyval == GDK_KEY_BackSpace) {
+        if (app.search_query[0] != '\0') {
+            process_quick_search_input(ev->keyval);
+            return TRUE;
+        }
+    }
+
+    if (ev->keyval == GDK_KEY_Up || ev->keyval == GDK_KEY_Down) {
+        if (app.view_mode == VIEW_MODE_LIST && app.tree_view) {
+            GtkTreeSelection *sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(app.tree_view));
+            if (!gtk_tree_selection_count_selected_rows(sel)) {
+                GtkTreeIter iter;
+                if (gtk_tree_model_get_iter_first(GTK_TREE_MODEL(app.list_store), &iter)) {
+                    GtkTreePath *path = gtk_tree_model_get_path(GTK_TREE_MODEL(app.list_store), &iter);
+                    gtk_tree_selection_select_path(sel, path);
+                    gtk_tree_view_scroll_to_cell(GTK_TREE_VIEW(app.tree_view), path, NULL, FALSE, 0, 0);
+                    gtk_tree_path_free(path);
+                    return TRUE;
+                }
+            }
+        } else if (app.view_mode == VIEW_MODE_ICONS && app.icon_view) {
+            GList *selected = gtk_icon_view_get_selected_items(GTK_ICON_VIEW(app.icon_view));
+            if (!selected) {
+                GtkTreeIter iter;
+                if (gtk_tree_model_get_iter_first(GTK_TREE_MODEL(app.list_store), &iter)) {
+                    GtkTreePath *path = gtk_tree_model_get_path(GTK_TREE_MODEL(app.list_store), &iter);
+                    gtk_icon_view_select_path(GTK_ICON_VIEW(app.icon_view), path);
+                    gtk_icon_view_scroll_to_path(GTK_ICON_VIEW(app.icon_view), path, FALSE, 0, 0);
+                    gtk_tree_path_free(path);
+                    return TRUE;
+                }
+            }
+            g_list_free_full(selected, (GDestroyNotify)gtk_tree_path_free);
+        }
+        return FALSE;
+    }
+
     GdkModifierType mods = ev->state & gtk_accelerator_get_default_mod_mask();
     guint keyval = (ev->keyval >= 0xFF00) ? ev->keyval : gdk_keyval_to_lower(ev->keyval);
 
@@ -2755,7 +2834,7 @@ static gboolean on_main_key_press(GtkWidget *w, GdkEventKey *ev, gpointer data) 
         return FALSE;
     }
 
-    if (ev->keyval == GDK_KEY_BackSpace || (gdk_keyval_to_unicode(ev->keyval) != 0 && g_unichar_isprint(gdk_keyval_to_unicode(ev->keyval)))) {
+    if (gdk_keyval_to_unicode(ev->keyval) != 0 && g_unichar_isprint(gdk_keyval_to_unicode(ev->keyval))) {
         process_quick_search_input(ev->keyval);
         return TRUE;
     }
