@@ -134,6 +134,7 @@ typedef struct {
 static AppState app = {0};
 
 static void set_status(const char *fmt, ...);
+static void set_status_markup(const char *fmt, ...);
 static void free_string_list(GList **list);
 static char *format_size(goffset size, gboolean is_dir);
 static GList *get_selected_paths(void);
@@ -204,7 +205,7 @@ static GList *get_selected_paths(void) {
 
 static void update_status_bar_info(void) {
     if (app.search_query[0] != '\0') {
-        set_status("Search: %s", app.search_query);
+        set_status_markup("Search: <span foreground=\"#e5c07b\" font_weight=\"bold\"><b>%s</b></span>", app.search_query);
         return;
     }
 
@@ -252,6 +253,31 @@ static void update_status_bar_info(void) {
     free_string_list(&sel);
 }
 
+static void open_currently_selected(void) {
+    GList *sel = get_selected_paths();
+    if (!sel || !sel->data) {
+        free_string_list(&sel);
+        return;
+    }
+    const char *path = sel->data;
+    if (g_str_has_prefix(app.current_dir, "trash:///")) {
+        set_status("Operation not supported directly from trash view");
+        free_string_list(&sel);
+        return;
+    }
+
+    if (g_file_test(path, G_FILE_TEST_IS_DIR)) {
+        navigate_to(path, TRUE);
+    } else {
+        char *uri = g_filename_to_uri(path, NULL, NULL);
+        if (uri) {
+            g_app_info_launch_default_for_uri(uri, NULL, NULL);
+            g_free(uri);
+        }
+    }
+    free_string_list(&sel);
+}
+
 static void set_status(const char *fmt, ...) {
     char buf[512];
     va_list args;
@@ -260,6 +286,17 @@ static void set_status(const char *fmt, ...) {
     va_end(args);
     if (app.status_label) {
         gtk_label_set_text(GTK_LABEL(app.status_label), buf);
+    }
+}
+
+static void set_status_markup(const char *fmt, ...) {
+    char buf[512];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    if (app.status_label) {
+        gtk_label_set_markup(GTK_LABEL(app.status_label), buf);
     }
 }
 
@@ -2574,7 +2611,7 @@ static void process_quick_search_input(guint keyval) {
         return;
     }
 
-    set_status("Search: %s", app.search_query);
+    set_status_markup("Search: <span foreground=\"#e5c07b\" font_weight=\"bold\"><b>%s</b></span>", app.search_query);
 
     GtkTreeModel *model = GTK_TREE_MODEL(app.list_store);
     GtkTreeIter iter;
@@ -2636,6 +2673,15 @@ static gboolean on_main_key_press(GtkWidget *w, GdkEventKey *ev, gpointer data) 
 
     if (ev->keyval == GDK_KEY_Escape) {
         if (app.search_query[0] != '\0') {
+            app.search_query[0] = '\0';
+            update_status_bar_info();
+            return TRUE;
+        }
+    }
+
+    if (ev->keyval == GDK_KEY_Return || ev->keyval == GDK_KEY_KP_Enter) {
+        if (app.search_query[0] != '\0') {
+            open_currently_selected();
             app.search_query[0] = '\0';
             update_status_bar_info();
             return TRUE;
@@ -2788,6 +2834,7 @@ static void build_ui(void) {
     gtk_box_pack_start(GTK_BOX(vbox), main_paned, TRUE, TRUE, 0);
 
     app.status_label = gtk_label_new("");
+    gtk_label_set_use_markup(GTK_LABEL(app.status_label), TRUE);
     gtk_widget_set_halign(app.status_label, GTK_ALIGN_START);
     gtk_widget_set_margin_start(app.status_label, 6);
     gtk_widget_set_margin_bottom(app.status_label, 3);
