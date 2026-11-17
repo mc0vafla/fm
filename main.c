@@ -3231,7 +3231,7 @@ static void build_ui(void) {
         gtk_widget_grab_focus(app.icon_view);
     } else {
         gtk_stack_set_visible_child_name(GTK_STACK(app.content_stack), "list");
-        gtk_widget_grab_focus(app.tree_view); // <--- Исправлено здесь
+        gtk_widget_grab_focus(app.tree_view); 
     }
     
     refresh_dir();
