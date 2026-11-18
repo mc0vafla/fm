@@ -2729,13 +2729,128 @@ static void open_settings_dialog(void) {
     gtk_widget_destroy(dlg);
 }
 
-typedef struct {
-    GtkWidget *list_box;
-} CustomActionsDlgCtx;
+static void refresh_custom_actions_list(GtkWidget *list_box);
+
+static void on_edit_custom_action(GtkButton *btn, gpointer user_data) {
+    CustomAction *ca = user_data;
+    if (!ca) return;
+
+    char *new_name = prompt_text("Edit Custom Action", "Action Name:", ca->name);
+    if (!new_name) return;
+    char *new_cmd = prompt_text("Edit Custom Action", "Shell Command (use %s for file):", ca->command);
+    if (!new_cmd) {
+        g_free(new_name);
+        return;
+    }
+
+    g_free(ca->name);
+    g_free(ca->command);
+    ca->name = new_name;
+    ca->command = new_cmd;
+    save_config();
+
+    GtkWidget *list_box = gtk_widget_get_ancestor(GTK_WIDGET(btn), GTK_TYPE_LIST_BOX);
+    if (list_box) {
+        refresh_custom_actions_list(list_box);
+    }
+}
+
+static void on_delete_custom_action(GtkButton *btn, gpointer user_data) {
+    CustomAction *ca = user_data;
+    if (!ca) return;
+
+    app.custom_actions = g_list_remove(app.custom_actions, ca);
+    g_free(ca->name);
+    g_free(ca->command);
+    g_free(ca);
+    save_config();
+
+    GtkWidget *list_box = gtk_widget_get_ancestor(GTK_WIDGET(btn), GTK_TYPE_LIST_BOX);
+    if (list_box) {
+        refresh_custom_actions_list(list_box);
+    }
+}
+
+static void on_move_custom_action_up(GtkButton *btn, gpointer user_data) {
+    CustomAction *ca = user_data;
+    GList *link = g_list_find(app.custom_actions, ca);
+    if (!link || !link->prev) return;
+
+    gpointer prev_data = link->prev->data;
+    link->prev->data = link->data;
+    link->data = prev_data;
+
+    save_config();
+
+    GtkWidget *list_box = gtk_widget_get_ancestor(GTK_WIDGET(btn), GTK_TYPE_LIST_BOX);
+    if (list_box) {
+        refresh_custom_actions_list(list_box);
+    }
+}
+
+static void on_move_custom_action_down(GtkButton *btn, gpointer user_data) {
+    CustomAction *ca = user_data;
+    GList *link = g_list_find(app.custom_actions, ca);
+    if (!link || !link->next) return;
+
+    gpointer next_data = link->next->data;
+    link->next->data = link->data;
+    link->data = next_data;
+
+    save_config();
+
+    GtkWidget *list_box = gtk_widget_get_ancestor(GTK_WIDGET(btn), GTK_TYPE_LIST_BOX);
+    if (list_box) {
+        refresh_custom_actions_list(list_box);
+    }
+}
+
+static void refresh_custom_actions_list(GtkWidget *list_box) {
+    GList *children = gtk_container_get_children(GTK_CONTAINER(list_box));
+    for (GList *l = children; l != NULL; l = l->next) {
+        gtk_widget_destroy(GTK_WIDGET(l->data));
+    }
+    g_list_free(children);
+
+    for (GList *l = app.custom_actions; l != NULL; l = l->next) {
+        CustomAction *ca = l->data;
+
+        GtkWidget *row_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+        gtk_container_set_border_width(GTK_CONTAINER(row_box), 4);
+
+        char *txt = g_strdup_printf("<b>%s</b>\n<small>%s</small>", ca->name, ca->command);
+        GtkWidget *lbl = gtk_label_new(NULL);
+        gtk_label_set_markup(GTK_LABEL(lbl), txt);
+        gtk_widget_set_halign(lbl, GTK_ALIGN_START);
+        gtk_widget_set_hexpand(lbl, TRUE);
+        g_free(txt);
+
+        GtkWidget *btn_up = gtk_button_new_from_icon_name("go-up", GTK_ICON_SIZE_BUTTON);
+        GtkWidget *btn_down = gtk_button_new_from_icon_name("go-down", GTK_ICON_SIZE_BUTTON);
+        GtkWidget *btn_edit = gtk_button_new_with_label("Edit");
+        GtkWidget *btn_del = gtk_button_new_with_label("Delete");
+
+        g_signal_connect(btn_up, "clicked", G_CALLBACK(on_move_custom_action_up), ca);
+        g_signal_connect(btn_down, "clicked", G_CALLBACK(on_move_custom_action_down), ca);
+        g_signal_connect(btn_edit, "clicked", G_CALLBACK(on_edit_custom_action), ca);
+        g_signal_connect(btn_del, "clicked", G_CALLBACK(on_delete_custom_action), ca);
+
+        gtk_box_pack_start(GTK_BOX(row_box), lbl, TRUE, TRUE, 0);
+        gtk_box_pack_start(GTK_BOX(row_box), btn_up, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(row_box), btn_down, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(row_box), btn_edit, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(row_box), btn_del, FALSE, FALSE, 0);
+
+        GtkWidget *row = gtk_list_box_row_new();
+        gtk_container_add(GTK_CONTAINER(row), row_box);
+        gtk_container_add(GTK_CONTAINER(list_box), row);
+    }
+    gtk_widget_show_all(list_box);
+}
 
 static void on_add_custom_action_clicked(GtkButton *btn, gpointer user_data) {
     (void)btn;
-    CustomActionsDlgCtx *dlg_ctx = user_data;
+    GtkWidget *list_box = user_data;
     char *name = prompt_text("New Custom Action", "Action Name:", NULL);
     if (!name) return;
     char *cmd = prompt_text("New Custom Action", "Shell Command (use %s for file):", NULL);
@@ -2750,21 +2865,7 @@ static void on_add_custom_action_clicked(GtkButton *btn, gpointer user_data) {
     app.custom_actions = g_list_append(app.custom_actions, ca);
     save_config();
 
-    GList *children = gtk_container_get_children(GTK_CONTAINER(dlg_ctx->list_box));
-    for (GList *l = children; l != NULL; l = l->next) gtk_widget_destroy(GTK_WIDGET(l->data));
-    g_list_free(children);
-
-    for (GList *l = app.custom_actions; l != NULL; l = l->next) {
-        CustomAction *item = l->data;
-        char *txt = g_strdup_printf("%s -> %s", item->name, item->command);
-        GtkWidget *row_lbl = gtk_label_new(txt);
-        gtk_widget_set_halign(row_lbl, GTK_ALIGN_START);
-        GtkWidget *row = gtk_list_box_row_new();
-        gtk_container_add(GTK_CONTAINER(row), row_lbl);
-        gtk_container_add(GTK_CONTAINER(dlg_ctx->list_box), row);
-        g_free(txt);
-    }
-    gtk_widget_show_all(dlg_ctx->list_box);
+    refresh_custom_actions_list(list_box);
 }
 
 static void open_custom_actions_dialog(void) {
@@ -2773,7 +2874,7 @@ static void open_custom_actions_dialog(void) {
     gtk_window_set_modal(GTK_WINDOW(dlg), TRUE);
     gtk_window_set_destroy_with_parent(GTK_WINDOW(dlg), TRUE);
     gtk_window_set_title(GTK_WINDOW(dlg), "Custom Actions Editor");
-    gtk_window_set_default_size(GTK_WINDOW(dlg), 450, 400);
+    gtk_window_set_default_size(GTK_WINDOW(dlg), 500, 420);
 
     GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dlg));
     gtk_container_set_border_width(GTK_CONTAINER(content), 12);
@@ -2785,20 +2886,10 @@ static void open_custom_actions_dialog(void) {
     gtk_container_add(GTK_CONTAINER(scroll), list_box);
     gtk_box_pack_start(GTK_BOX(content), scroll, TRUE, TRUE, 0);
 
-    for (GList *l = app.custom_actions; l != NULL; l = l->next) {
-        CustomAction *item = l->data;
-        char *txt = g_strdup_printf("%s -> %s", item->name, item->command);
-        GtkWidget *row_lbl = gtk_label_new(txt);
-        gtk_widget_set_halign(row_lbl, GTK_ALIGN_START);
-        GtkWidget *row = gtk_list_box_row_new();
-        gtk_container_add(GTK_CONTAINER(row), row_lbl);
-        gtk_container_add(GTK_CONTAINER(list_box), row);
-        g_free(txt);
-    }
+    refresh_custom_actions_list(list_box);
 
-    CustomActionsDlgCtx dlg_ctx = { .list_box = list_box };
     GtkWidget *add_btn = gtk_button_new_with_label("Add New Action");
-    g_signal_connect(add_btn, "clicked", G_CALLBACK(on_add_custom_action_clicked), &dlg_ctx);
+    g_signal_connect(add_btn, "clicked", G_CALLBACK(on_add_custom_action_clicked), list_box);
     gtk_box_pack_start(GTK_BOX(content), add_btn, FALSE, FALSE, 0);
 
     gtk_widget_show_all(dlg);
