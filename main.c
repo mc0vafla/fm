@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <limits.h>
+#include <pthread.h>
 
 typedef enum {
     VIEW_MODE_LIST,
@@ -96,7 +97,6 @@ typedef struct {
     char *full_path;
     int icon_size;
     guint gen_id;
-    GtkTreeRowReference *row_ref;
 } ThumbnailTask;
 
 typedef struct {
@@ -131,6 +131,7 @@ typedef struct {
     guint generation_id;
 
     GFileMonitor *dir_monitor;
+    pthread_mutex_t state_mutex;
 } AppState;
 
 static AppState app = {0};
@@ -257,15 +258,24 @@ static char *get_free_space_string(const char *path) {
 
 static GList *get_selected_paths(void) {
     GList *paths = NULL;
+    pthread_mutex_lock(&app.state_mutex);
+    
     if (app.view_mode == VIEW_MODE_LIST) {
-        if (!app.tree_view) return NULL;
+        if (!app.tree_view || !GTK_IS_TREE_VIEW(app.tree_view) || !gtk_widget_get_realized(app.tree_view)) {
+            pthread_mutex_unlock(&app.state_mutex);
+            return NULL;
+        }
         GtkTreeSelection *sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(app.tree_view));
-        if (!sel) return NULL;
+        if (!sel) {
+            pthread_mutex_unlock(&app.state_mutex);
+            return NULL;
+        }
         
         GtkTreeModel *model = NULL;
         GList *rows = gtk_tree_selection_get_selected_rows(sel, &model);
-        if (!rows || !model) {
+        if (!rows || !model || !GTK_IS_TREE_MODEL(model)) {
             if (rows) g_list_free_full(rows, (GDestroyNotify)gtk_tree_path_free);
+            pthread_mutex_unlock(&app.state_mutex);
             return NULL;
         }
         for (GList *l = rows; l != NULL; l = l->next) {
@@ -278,14 +288,25 @@ static GList *get_selected_paths(void) {
         }
         g_list_free_full(rows, (GDestroyNotify)gtk_tree_path_free);
     } else {
-        if (!app.icon_view) return NULL;
+        if (!app.icon_view || !GTK_IS_ICON_VIEW(app.icon_view) || !gtk_widget_get_realized(app.icon_view)) {
+            pthread_mutex_unlock(&app.state_mutex);
+            return NULL;
+        }
         GtkIconView *iv = GTK_ICON_VIEW(app.icon_view);
+        if (!gtk_icon_view_get_model(iv)) {
+            pthread_mutex_unlock(&app.state_mutex);
+            return NULL;
+        }
         GList *items = gtk_icon_view_get_selected_items(iv);
-        if (!items) return NULL; 
+        if (!items) {
+            pthread_mutex_unlock(&app.state_mutex);
+            return NULL;
+        }
 
         GtkTreeModel *model = gtk_icon_view_get_model(iv);
-        if (!model) {
+        if (!model || !GTK_IS_TREE_MODEL(model)) {
             g_list_free_full(items, (GDestroyNotify)gtk_tree_path_free);
+            pthread_mutex_unlock(&app.state_mutex);
             return NULL;
         }
 
@@ -299,10 +320,12 @@ static GList *get_selected_paths(void) {
         }
         g_list_free_full(items, (GDestroyNotify)gtk_tree_path_free);
     }
+    pthread_mutex_unlock(&app.state_mutex);
     return g_list_reverse(paths);
 }
 
 static void update_status_bar_info(void) {
+    if (!app.window || !gtk_widget_get_realized(app.window)) return;
     if (app.search_query[0] != '\0') {
         set_status_markup("Search: <span foreground=\"#D35856\" font_weight=\"bold\"><b>%s</b></span>", app.search_query);
         return;
@@ -311,7 +334,7 @@ static void update_status_bar_info(void) {
     GList *sel = get_selected_paths();
     guint count = g_list_length(sel);
     char *free_space = get_free_space_string(app.current_dir);
-    int items_count = app.list_store ? gtk_tree_model_iter_n_children(GTK_TREE_MODEL(app.list_store), NULL) : 0;
+    int items_count = app.list_store && GTK_IS_TREE_MODEL(app.list_store) ? gtk_tree_model_iter_n_children(GTK_TREE_MODEL(app.list_store), NULL) : 0;
 
     if (count == 0) {
         set_status("Free space: %s | Items: %d", free_space ? free_space : "N/A", items_count);
@@ -383,7 +406,7 @@ static void set_status(const char *fmt, ...) {
     va_start(args, fmt);
     vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
-    if (app.status_label) {
+    if (app.status_label && GTK_IS_LABEL(app.status_label)) {
         gtk_label_set_text(GTK_LABEL(app.status_label), buf);
     }
 }
@@ -394,7 +417,7 @@ static void set_status_markup(const char *fmt, ...) {
     va_start(args, fmt);
     vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
-    if (app.status_label) {
+    if (app.status_label && GTK_IS_LABEL(app.status_label)) {
         gtk_label_set_markup(GTK_LABEL(app.status_label), buf);
     }
 }
@@ -479,97 +502,123 @@ static GdkPixbuf *get_fast_file_icon(gboolean is_dir, const char *name, int size
 }
 
 static GdkPixbuf *get_heavy_thumbnail(const char *full_path, int size) {
-    if (!full_path) return NULL;
+    if (!full_path || !g_file_test(full_path, G_FILE_TEST_EXISTS)) return NULL;
     GdkPixbuf *pix = NULL;
     char *uri = g_filename_to_uri(full_path, NULL, NULL);
-    if (uri) {
-        GChecksum *checksum = g_checksum_new(G_CHECKSUM_MD5);
-        g_checksum_update(checksum, (const guchar *)uri, strlen(uri));
-        const char *hash = g_checksum_get_string(checksum);
-        char *hash_filename = g_strconcat(hash, ".png", NULL);
-        
-        char *thumb_path_normal = g_build_filename(g_get_user_cache_dir(), "thumbnails", "normal", hash_filename, NULL);
-        char *thumb_path_large = g_build_filename(g_get_user_cache_dir(), "thumbnails", "large", hash_filename, NULL);
-        
-        if (g_file_test(thumb_path_large, G_FILE_TEST_EXISTS) && size > 128) {
-            pix = gdk_pixbuf_new_from_file_at_scale(thumb_path_large, size, size, TRUE, NULL);
+    if (!uri) return NULL;
+
+    GChecksum *checksum = g_checksum_new(G_CHECKSUM_MD5);
+    if (!checksum) {
+        g_free(uri);
+        return NULL;
+    }
+
+    g_checksum_update(checksum, (const guchar *)uri, strlen(uri));
+    const char *hash = g_checksum_get_string(checksum);
+    if (!hash) {
+        g_checksum_free(checksum);
+        g_free(uri);
+        return NULL;
+    }
+
+    char *hash_filename = g_strconcat(hash, ".png", NULL);
+    char *thumb_path_normal = g_build_filename(g_get_user_cache_dir(), "thumbnails", "normal", hash_filename, NULL);
+    char *thumb_path_large = g_build_filename(g_get_user_cache_dir(), "thumbnails", "large", hash_filename, NULL);
+    
+    if (thumb_path_large && g_file_test(thumb_path_large, G_FILE_TEST_EXISTS) && size > 128) {
+        pix = gdk_pixbuf_new_from_file_at_scale(thumb_path_large, size, size, TRUE, NULL);
+    }
+    if (!pix && thumb_path_normal && g_file_test(thumb_path_normal, G_FILE_TEST_EXISTS)) {
+        pix = gdk_pixbuf_new_from_file_at_scale(thumb_path_normal, size, size, TRUE, NULL);
+    }
+
+    if (!pix) {
+        const char *ext = strrchr(full_path, '.');
+        gboolean is_mp3 = ext && (g_ascii_strcasecmp(ext, ".mp3") == 0 || g_ascii_strcasecmp(ext, ".flac") == 0);
+        gboolean is_video = ext && (g_ascii_strcasecmp(ext, ".mp4") == 0 || 
+                                   g_ascii_strcasecmp(ext, ".mkv") == 0 || 
+                                   g_ascii_strcasecmp(ext, ".avi") == 0 || 
+                                   g_ascii_strcasecmp(ext, ".webm") == 0 || 
+                                   g_ascii_strcasecmp(ext, ".mov") == 0);
+
+        char *tmp_img = g_strdup_printf("/tmp/fm_cover_%u.jpg", g_random_int());
+        char *cmd = NULL;
+
+        if (is_mp3) {
+            cmd = g_strdup_printf("ffmpeg -y -i %s -an -vcodec copy %s 2>/dev/null", 
+                                        g_shell_quote(full_path), 
+                                        g_shell_quote(tmp_img));
+        } else if (is_video) {
+            cmd = g_strdup_printf("ffmpeg -y -ss 00:00:02 -i %s -vframes 1 %s 2>/dev/null", 
+                                        g_shell_quote(full_path), 
+                                        g_shell_quote(tmp_img));
         }
-        if (!pix && g_file_test(thumb_path_normal, G_FILE_TEST_EXISTS)) {
-            pix = gdk_pixbuf_new_from_file_at_scale(thumb_path_normal, size, size, TRUE, NULL);
+
+        if (cmd) {
+            if (system(cmd) == 0 && tmp_img && g_file_test(tmp_img, G_FILE_TEST_EXISTS)) {
+                pix = gdk_pixbuf_new_from_file_at_scale(tmp_img, size, size, TRUE, NULL);
+            }
+            if (tmp_img) {
+                unlink(tmp_img);
+                g_free(tmp_img);
+            }
+            g_free(cmd);
+        } else {
+            g_free(tmp_img);
         }
 
         if (!pix) {
-            const char *ext = strrchr(full_path, '.');
-            gboolean is_mp3 = ext && (g_ascii_strcasecmp(ext, ".mp3") == 0 || g_ascii_strcasecmp(ext, ".flac") == 0);
-            gboolean is_video = ext && (g_ascii_strcasecmp(ext, ".mp4") == 0 || 
-                                       g_ascii_strcasecmp(ext, ".mkv") == 0 || 
-                                       g_ascii_strcasecmp(ext, ".avi") == 0 || 
-                                       g_ascii_strcasecmp(ext, ".webm") == 0 || 
-                                       g_ascii_strcasecmp(ext, ".mov") == 0);
-
-            char *tmp_img = g_strdup_printf("/tmp/fm_cover_%u.jpg", g_random_int());
-            char *cmd = NULL;
-
-            if (is_mp3) {
-                cmd = g_strdup_printf("ffmpeg -y -i %s -an -vcodec copy %s 2>/dev/null", 
-                                            g_shell_quote(full_path), 
-                                            g_shell_quote(tmp_img));
-            } else if (is_video) {
-                cmd = g_strdup_printf("ffmpeg -y -ss 00:00:02 -i %s -vframes 1 %s 2>/dev/null", 
-                                            g_shell_quote(full_path), 
-                                            g_shell_quote(tmp_img));
-            }
-
-            if (cmd) {
-                if (system(cmd) == 0 && g_file_test(tmp_img, G_FILE_TEST_EXISTS)) {
-                    pix = gdk_pixbuf_new_from_file_at_scale(tmp_img, size, size, TRUE, NULL);
-                }
-                unlink(tmp_img);
-                g_free(cmd);
-            }
-            g_free(tmp_img);
-
-            if (!pix) {
-                pix = gdk_pixbuf_new_from_file_at_scale(full_path, size, size, TRUE, NULL);
-            }
-            
-            if (pix) {
-                char *normal_dir = g_build_filename(g_get_user_cache_dir(), "thumbnails", "normal", NULL);
+            pix = gdk_pixbuf_new_from_file_at_scale(full_path, size, size, TRUE, NULL);
+        }
+        
+        if (pix && thumb_path_normal) {
+            char *normal_dir = g_build_filename(g_get_user_cache_dir(), "thumbnails", "normal", NULL);
+            if (normal_dir) {
                 g_mkdir_with_parents(normal_dir, 0755);
                 gdk_pixbuf_save(pix, thumb_path_normal, "png", NULL, NULL);
                 g_free(normal_dir);
             }
         }
-
-        g_free(thumb_path_normal);
-        g_free(thumb_path_large);
-        g_free(hash_filename);
-        g_checksum_free(checksum);
-        g_free(uri);
     }
+
+    if (thumb_path_normal) g_free(thumb_path_normal);
+    if (thumb_path_large) g_free(thumb_path_large);
+    if (hash_filename) g_free(hash_filename);
+    if (checksum) g_checksum_free(checksum);
+    if (uri) g_free(uri);
+
     return pix;
 }
 
 typedef struct {
-    GtkTreeRowReference *row_ref;
+    char *full_path;
     GdkPixbuf *pixbuf;
     guint gen_id;
 } ThumbnailResult;
 
 static gboolean apply_thumbnail_in_main(gpointer data) {
     ThumbnailResult *res = data;
-    if (res->gen_id == app.generation_id && app.list_store) {
-        GtkTreePath *path = gtk_tree_row_reference_get_path(res->row_ref);
-        if (path) {
-            GtkTreeIter iter;
-            if (gtk_tree_model_get_iter(GTK_TREE_MODEL(app.list_store), &iter, path)) {
+    pthread_mutex_lock(&app.state_mutex);
+    if (res->gen_id == app.generation_id && app.list_store && GTK_IS_LIST_STORE(app.list_store)) {
+        GtkTreeModel *model = GTK_TREE_MODEL(app.list_store);
+        GtkTreeIter iter;
+        gboolean valid = gtk_tree_model_get_iter_first(model, &iter);
+        while (valid) {
+            char *path = NULL;
+            gtk_tree_model_get(model, &iter, COL_FULL_PATH, &path, -1);
+            if (path && g_strcmp0(path, res->full_path) == 0) {
                 gtk_list_store_set(app.list_store, &iter, COL_PIXBUF, res->pixbuf, -1);
+                g_free(path);
+                break;
             }
-            gtk_tree_path_free(path);
+            g_free(path);
+            valid = gtk_tree_model_iter_next(model, &iter);
         }
     }
+    pthread_mutex_unlock(&app.state_mutex);
+
     if (res->pixbuf) g_object_unref(res->pixbuf);
-    gtk_tree_row_reference_free(res->row_ref);
+    g_free(res->full_path);
     g_free(res);
     return G_SOURCE_REMOVE;
 }
@@ -579,19 +628,26 @@ static void thumbnail_worker_thread(gpointer data, gpointer user_data) {
     ThumbnailTask *task = data;
     if (!task) return;
 
-    if (task->gen_id == app.generation_id) {
+    pthread_mutex_lock(&app.state_mutex);
+    guint current_gen = app.generation_id;
+    pthread_mutex_unlock(&app.state_mutex);
+
+    if (task->gen_id == current_gen) {
         GdkPixbuf *pix = get_heavy_thumbnail(task->full_path, task->icon_size);
-        if (pix) {
+        
+        pthread_mutex_lock(&app.state_mutex);
+        guint latest_gen = app.generation_id;
+        pthread_mutex_unlock(&app.state_mutex);
+
+        if (task->gen_id == latest_gen && pix) {
             ThumbnailResult *res = g_new0(ThumbnailResult, 1);
-            res->row_ref = task->row_ref;
+            res->full_path = g_strdup(task->full_path);
             res->pixbuf = pix;
             res->gen_id = task->gen_id;
             g_idle_add(apply_thumbnail_in_main, res);
         } else {
-            gtk_tree_row_reference_free(task->row_ref);
+            if (pix) g_object_unref(pix);
         }
-    } else {
-        gtk_tree_row_reference_free(task->row_ref);
     }
     g_free(task->full_path);
     g_free(task);
@@ -842,7 +898,10 @@ static int compare_file_info(gconstpointer a, gconstpointer b, gpointer user_dat
 static void refresh_dir(void) {
     if (!app.list_store || !app.path_entry || !app.current_dir) return;
 
+    pthread_mutex_lock(&app.state_mutex);
     app.generation_id++;
+    pthread_mutex_unlock(&app.state_mutex);
+
     app.search_query[0] = '\0';
 
     gtk_list_store_clear(app.list_store);
@@ -942,19 +1001,15 @@ static void refresh_dir(void) {
         gboolean can_have_thumbnail = !is_dir;
 
         if (can_have_thumbnail) {
-            GtkTreePath *tree_path = gtk_tree_model_get_path(GTK_TREE_MODEL(app.list_store), &iter);
-            if (tree_path) {
-                GtkTreeRowReference *row_ref = gtk_tree_row_reference_new(GTK_TREE_MODEL(app.list_store), tree_path);
-                gtk_tree_path_free(tree_path);
-
-                ThumbnailTask *task = g_new0(ThumbnailTask, 1);
-                task->full_path = g_build_filename(app.current_dir, name ? name : "", NULL);
-                task->icon_size = current_icon_size;
-                task->gen_id = app.generation_id;
-                task->row_ref = row_ref;
-
-                g_thread_pool_push(app.thread_pool, task, NULL);
-            }
+            ThumbnailTask *task = g_new0(ThumbnailTask, 1);
+            task->full_path = g_build_filename(app.current_dir, name ? name : "", NULL);
+            task->icon_size = current_icon_size;
+            
+            pthread_mutex_lock(&app.state_mutex);
+            task->gen_id = app.generation_id;
+            pthread_mutex_unlock(&app.state_mutex);
+            
+            g_thread_pool_push(app.thread_pool, task, NULL);
         }
 
         if (pix) g_object_unref(pix);
@@ -1214,6 +1269,11 @@ static gboolean on_view_button_press(GtkWidget *widget, GdkEventButton *ev, gpoi
     }
     if (ev->button == 9) {
         go_forward();
+        return TRUE;
+    }
+
+    if (ev->button == GDK_BUTTON_PRIMARY && ev->type == GDK_2BUTTON_PRESS) {
+        open_currently_selected();
         return TRUE;
     }
 
@@ -2545,7 +2605,9 @@ static gboolean on_view_scroll_event(GtkWidget *widget, GdkEventScroll *ev, gpoi
             app.icon_size -= 16;
             if (app.icon_size < 32) app.icon_size = 32;
         }
-        gtk_icon_view_set_item_width(GTK_ICON_VIEW(app.icon_view), app.icon_size + 12);
+        if (app.icon_view && GTK_IS_ICON_VIEW(app.icon_view)) {
+            gtk_icon_view_set_item_width(GTK_ICON_VIEW(app.icon_view), app.icon_size + 12);
+        }
         save_config();
         refresh_dir();
         return TRUE;
@@ -3114,9 +3176,9 @@ static void on_selection_changed(gpointer data) {
 static void on_path_activate(GtkEntry *entry, gpointer data) {
     (void)data;
     navigate_to(gtk_entry_get_text(entry), TRUE);
-    if (app.view_mode == VIEW_MODE_LIST) {
+    if (app.view_mode == VIEW_MODE_LIST && app.tree_view && GTK_IS_WIDGET(app.tree_view)) {
         gtk_widget_grab_focus(app.tree_view);
-    } else {
+    } else if (app.icon_view && GTK_IS_WIDGET(app.icon_view)) {
         gtk_widget_grab_focus(app.icon_view);
     }
 }
@@ -3167,6 +3229,7 @@ static void process_quick_search_input(guint keyval) {
 
     set_status_markup("Search: <span foreground=\"#e5c07b\" font_weight=\"bold\"><b>%s</b></span>", app.search_query);
 
+    if (!app.list_store || !GTK_IS_TREE_MODEL(app.list_store)) return;
     GtkTreeModel *model = GTK_TREE_MODEL(app.list_store);
     GtkTreeIter iter;
     gboolean valid = gtk_tree_model_get_iter_first(model, &iter);
@@ -3198,13 +3261,13 @@ static void process_quick_search_input(guint keyval) {
     }
 
     if (best_path && best_score > 0) {
-        if (app.view_mode == VIEW_MODE_LIST) {
+        if (app.view_mode == VIEW_MODE_LIST && app.tree_view && GTK_IS_TREE_VIEW(app.tree_view)) {
             GtkTreeSelection *sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(app.tree_view));
             gtk_tree_selection_unselect_all(sel);
             gtk_tree_selection_select_path(sel, best_path);
             gtk_tree_view_set_cursor(GTK_TREE_VIEW(app.tree_view), best_path, NULL, FALSE);
             gtk_tree_view_scroll_to_cell(GTK_TREE_VIEW(app.tree_view), best_path, NULL, FALSE, 0, 0);
-        } else {
+        } else if (app.icon_view && GTK_IS_ICON_VIEW(app.icon_view)) {
             gtk_icon_view_unselect_all(GTK_ICON_VIEW(app.icon_view));
             gtk_icon_view_select_path(GTK_ICON_VIEW(app.icon_view), best_path);
             gtk_icon_view_set_cursor(GTK_ICON_VIEW(app.icon_view), best_path, NULL, FALSE);
@@ -3220,8 +3283,8 @@ static gboolean on_main_key_press(GtkWidget *w, GdkEventKey *ev, gpointer data) 
     if (gtk_widget_has_focus(app.path_entry)) {
         if (ev->keyval == GDK_KEY_Escape) {
             gtk_entry_set_text(GTK_ENTRY(app.path_entry), app.current_dir);
-            if (app.view_mode == VIEW_MODE_LIST) gtk_widget_grab_focus(app.tree_view);
-            else gtk_widget_grab_focus(app.icon_view);
+            if (app.view_mode == VIEW_MODE_LIST && app.tree_view && GTK_IS_WIDGET(app.tree_view)) gtk_widget_grab_focus(app.tree_view);
+            else if (app.icon_view && GTK_IS_WIDGET(app.icon_view)) gtk_widget_grab_focus(app.icon_view);
             return TRUE;
         }
         return FALSE;
@@ -3252,11 +3315,11 @@ static gboolean on_main_key_press(GtkWidget *w, GdkEventKey *ev, gpointer data) 
     }
 
     if (ev->keyval == GDK_KEY_Up || ev->keyval == GDK_KEY_Down) {
-        if (app.view_mode == VIEW_MODE_LIST && app.tree_view) {
+        if (app.view_mode == VIEW_MODE_LIST && app.tree_view && GTK_IS_TREE_VIEW(app.tree_view)) {
             GtkTreeSelection *sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(app.tree_view));
             if (!gtk_tree_selection_count_selected_rows(sel)) {
                 GtkTreeIter iter;
-                if (gtk_tree_model_get_iter_first(GTK_TREE_MODEL(app.list_store), &iter)) {
+                if (app.list_store && GTK_IS_TREE_MODEL(app.list_store) && gtk_tree_model_get_iter_first(GTK_TREE_MODEL(app.list_store), &iter)) {
                     GtkTreePath *path = gtk_tree_model_get_path(GTK_TREE_MODEL(app.list_store), &iter);
                     gtk_tree_selection_select_path(sel, path);
                     gtk_tree_view_scroll_to_cell(GTK_TREE_VIEW(app.tree_view), path, NULL, FALSE, 0, 0);
@@ -3264,11 +3327,11 @@ static gboolean on_main_key_press(GtkWidget *w, GdkEventKey *ev, gpointer data) 
                     return TRUE;
                 }
             }
-        } else if (app.view_mode == VIEW_MODE_ICONS && app.icon_view) {
+        } else if (app.view_mode == VIEW_MODE_ICONS && app.icon_view && GTK_IS_ICON_VIEW(app.icon_view)) {
             GList *selected = gtk_icon_view_get_selected_items(GTK_ICON_VIEW(app.icon_view));
             if (!selected) {
                 GtkTreeIter iter;
-                if (gtk_tree_model_get_iter_first(GTK_TREE_MODEL(app.list_store), &iter)) {
+                if (app.list_store && GTK_IS_TREE_MODEL(app.list_store) && gtk_tree_model_get_iter_first(GTK_TREE_MODEL(app.list_store), &iter)) {
                     GtkTreePath *path = gtk_tree_model_get_path(GTK_TREE_MODEL(app.list_store), &iter);
                     gtk_icon_view_select_path(GTK_ICON_VIEW(app.icon_view), path);
                     gtk_icon_view_scroll_to_path(GTK_ICON_VIEW(app.icon_view), path, FALSE, 0, 0);
@@ -3400,8 +3463,8 @@ static void build_ui(void) {
     gtk_icon_view_set_margin(GTK_ICON_VIEW(app.icon_view), 6);
 
     g_signal_connect_swapped(app.icon_view, "selection-changed", G_CALLBACK(on_selection_changed), NULL);
-    g_signal_connect(app.icon_view, "item-activated", G_CALLBACK(on_icon_activated), NULL);
-    g_signal_connect(app.icon_view, "scroll-event", G_CALLBACK(on_view_scroll_event), NULL);
+    g_signal_connect_swapped(app.icon_view, "item-activated", G_CALLBACK(on_icon_activated), NULL);
+    g_signal_connect_swapped(app.icon_view, "scroll-event", G_CALLBACK(on_view_scroll_event), NULL);
 
     {
         static GtkTargetEntry drag_targets[] = {
@@ -3470,6 +3533,8 @@ static void build_ui(void) {
 int main(int argc, char **argv) {
     gtk_init(&argc, &argv);
 
+    pthread_mutex_init(&app.state_mutex, NULL);
+
     int num_cores = g_get_num_processors();
     int thread_count = (num_cores > 2) ? (num_cores > 8 ? 8 : num_cores) : 2;
     app.thread_pool = g_thread_pool_new(thumbnail_worker_thread, NULL, thread_count, FALSE, NULL);
@@ -3495,6 +3560,8 @@ int main(int argc, char **argv) {
     if (app.thread_pool) {
         g_thread_pool_free(app.thread_pool, FALSE, TRUE);
     }
+
+    pthread_mutex_destroy(&app.state_mutex);
 
     return 0;
 }
