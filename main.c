@@ -51,6 +51,7 @@ typedef enum {
     ACT_UNDO,
     ACT_TERM,
     ACT_UP,
+    ACT_HOME,
     ACT_BACK,
     ACT_FORWARD,
     ACT_REFRESH,
@@ -323,6 +324,49 @@ static GList *get_selected_paths(void) {
     }
     pthread_mutex_unlock(&app.state_mutex);
     return g_list_reverse(paths);
+}
+
+static gboolean clear_selection_if_any(void) {
+    GtkTreeSelection *tree_sel = NULL;
+    GtkIconView *iv = NULL;
+    gboolean had_selection = FALSE;
+
+    pthread_mutex_lock(&app.state_mutex);
+    if (app.view_mode == VIEW_MODE_LIST) {
+        if (app.tree_view && GTK_IS_TREE_VIEW(app.tree_view)) {
+            tree_sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(app.tree_view));
+            if (tree_sel && gtk_tree_selection_count_selected_rows(tree_sel) > 0) {
+                had_selection = TRUE;
+            } else {
+                tree_sel = NULL;
+            }
+        }
+    } else {
+        if (app.icon_view && GTK_IS_ICON_VIEW(app.icon_view)) {
+            iv = GTK_ICON_VIEW(app.icon_view);
+            GList *items = gtk_icon_view_get_selected_items(iv);
+            if (items) {
+                had_selection = TRUE;
+                g_list_free_full(items, (GDestroyNotify)gtk_tree_path_free);
+            } else {
+                iv = NULL;
+            }
+        }
+    }
+    pthread_mutex_unlock(&app.state_mutex);
+
+    if (!had_selection) {
+        return FALSE;
+    }
+
+    if (tree_sel) {
+        gtk_tree_selection_unselect_all(tree_sel);
+    } else if (iv) {
+        gtk_icon_view_unselect_all(iv);
+    }
+
+    update_status_bar_info();
+    return TRUE;
 }
 
 static void update_status_bar_info(void) {
@@ -666,6 +710,7 @@ static void init_default_binds(void) {
     app.binds[ACT_UNDO]           = (Keybind){"undo",           "Undo",            GDK_KEY_z,         GDK_CONTROL_MASK};
     app.binds[ACT_TERM]           = (Keybind){"terminal",       "Open Terminal",   GDK_KEY_t,         GDK_CONTROL_MASK};
     app.binds[ACT_UP]             = (Keybind){"up",             "Parent Directory",GDK_KEY_BackSpace, 0};
+    app.binds[ACT_HOME]           = (Keybind){"home",           "Home Directory",  GDK_KEY_Tab,       GDK_CONTROL_MASK};
     app.binds[ACT_BACK]           = (Keybind){"back",           "History Back",    GDK_KEY_Left,      GDK_MOD1_MASK};
     app.binds[ACT_FORWARD]        = (Keybind){"forward",        "History Forward", GDK_KEY_Right,     GDK_MOD1_MASK};
     app.binds[ACT_REFRESH]        = (Keybind){"refresh",        "Refresh",         GDK_KEY_r,         GDK_CONTROL_MASK};
@@ -2329,6 +2374,13 @@ static void execute_action(ActionId act) {
             g_free(parent);
             break;
         }
+        case ACT_HOME: {
+            const char *home = g_get_home_dir();
+            if (home && *home) {
+                navigate_to(home, TRUE);
+            }
+            break;
+        }
         case ACT_BACK:
             go_back();
             break;
@@ -3394,6 +3446,9 @@ static gboolean on_main_key_press(GtkWidget *w, GdkEventKey *ev, gpointer data) 
         if (app.search_query[0] != '\0') {
             app.search_query[0] = '\0';
             update_status_bar_info();
+            return TRUE;
+        }
+        if (clear_selection_if_any()) {
             return TRUE;
         }
     }
