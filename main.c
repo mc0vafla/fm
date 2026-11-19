@@ -848,11 +848,13 @@ static gboolean copy_recursive(GFile *src, GFile *dst, GFileCopyFlags flags, GEr
     GFileType type = g_file_query_file_type(src, G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, NULL);
 
     if (type == G_FILE_TYPE_DIRECTORY) {
-        if (!g_file_make_directory_with_parents(dst, NULL, error)) {
-            if (!g_error_matches(*error, G_IO_ERROR, G_IO_ERROR_EXISTS)) {
+        GError *dir_err = NULL;
+        if (!g_file_make_directory_with_parents(dst, NULL, &dir_err)) {
+            if (!g_error_matches(dir_err, G_IO_ERROR, G_IO_ERROR_EXISTS)) {
+                g_propagate_error(error, dir_err);
                 return FALSE;
             }
-            g_clear_error(error);
+            g_clear_error(&dir_err);
         }
 
         GFileEnumerator *en = g_file_enumerate_children(
@@ -1264,10 +1266,19 @@ static int process_file_operation(const char *src_path, const char *dest_dir, gb
         GError *err = NULL;
         gboolean res = FALSE;
 
+        GFileCopyFlags flags = G_FILE_COPY_OVERWRITE | G_FILE_COPY_NOFOLLOW_SYMLINKS;
+
         if (is_move) {
-            res = g_file_move(f_src, f_dst, G_FILE_COPY_OVERWRITE | G_FILE_COPY_NOFOLLOW_SYMLINKS, NULL, NULL, NULL, &err);
+            GError *move_err = NULL;
+            res = g_file_move(f_src, f_dst, flags, NULL, NULL, NULL, &move_err);
+            if (!res) {
+                g_clear_error(&move_err);
+                if (copy_recursive(f_src, f_dst, flags, &err)) {
+                    res = delete_recursive(f_src, &err);
+                }
+            }
         } else {
-            res = copy_recursive(f_src, f_dst, G_FILE_COPY_OVERWRITE | G_FILE_COPY_NOFOLLOW_SYMLINKS, &err);
+            res = copy_recursive(f_src, f_dst, flags, &err);
         }
 
         if (res) {
