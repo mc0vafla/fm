@@ -1103,6 +1103,23 @@ static void setup_directory_monitor(const char *path) {
     g_object_unref(file);
 }
 
+static char *expand_tilde_path(const char *path) {
+    if (!path || path[0] != '~') {
+        return g_strdup(path ? path : "");
+    }
+    const char *home = g_get_home_dir();
+    if (!home || !*home) {
+        return g_strdup(path);
+    }
+    if (path[1] == '\0') {
+        return g_strdup(home);
+    }
+    if (path[1] == '/') {
+        return g_build_filename(home, path + 2, NULL);
+    }
+    return g_strdup(path);
+}
+
 static void navigate_to(const char *path, gboolean record_history) {
     if (!path) return;
 
@@ -1118,12 +1135,14 @@ static void navigate_to(const char *path, gboolean record_history) {
         return;
     }
 
-    char *real = realpath(path, NULL);
-    const char *target = real ? real : path;
+    char *expanded = expand_tilde_path(path);
+    char *real = realpath(expanded, NULL);
+    const char *target = real ? real : expanded;
 
     if (!g_file_test(target, G_FILE_TEST_IS_DIR)) {
         set_status("Directory not found: %s", target);
         free(real);
+        g_free(expanded);
         return;
     }
 
@@ -1135,6 +1154,7 @@ static void navigate_to(const char *path, gboolean record_history) {
     g_free(app.current_dir);
     app.current_dir = g_strdup(target);
     free(real);
+    g_free(expanded);
 
     setup_directory_monitor(app.current_dir);
     refresh_dir();
@@ -3429,6 +3449,17 @@ static void process_quick_search_input(guint keyval) {
     }
 }
 
+static void start_path_entry_with_text(const char *initial_text) {
+    if (!app.path_entry || !GTK_IS_ENTRY(app.path_entry)) return;
+    if (app.search_query[0] != '\0') {
+        app.search_query[0] = '\0';
+        update_status_bar_info();
+    }
+    gtk_widget_grab_focus(app.path_entry);
+    gtk_entry_set_text(GTK_ENTRY(app.path_entry), initial_text ? initial_text : "");
+    gtk_editable_set_position(GTK_EDITABLE(app.path_entry), -1);
+}
+
 static gboolean on_main_key_press(GtkWidget *w, GdkEventKey *ev, gpointer data) {
     (void)w; (void)data;
 
@@ -3512,6 +3543,16 @@ static gboolean on_main_key_press(GtkWidget *w, GdkEventKey *ev, gpointer data) 
 
     if ((mods & (GDK_CONTROL_MASK | GDK_MOD1_MASK | GDK_SUPER_MASK)) != 0) {
         return FALSE;
+    }
+
+    if (ev->keyval == GDK_KEY_slash) {
+        start_path_entry_with_text("/");
+        return TRUE;
+    }
+
+    if (ev->keyval == GDK_KEY_asciitilde) {
+        start_path_entry_with_text("~/");
+        return TRUE;
     }
 
     if (gdk_keyval_to_unicode(ev->keyval) != 0 && g_unichar_isprint(gdk_keyval_to_unicode(ev->keyval))) {
