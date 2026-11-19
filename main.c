@@ -40,6 +40,7 @@ enum {
 };
 
 typedef enum {
+    ACT_OPEN,
     ACT_NEW_FILE,
     ACT_NEW_DIR,
     ACT_RENAME,
@@ -654,6 +655,7 @@ static void thumbnail_worker_thread(gpointer data, gpointer user_data) {
 }
 
 static void init_default_binds(void) {
+    app.binds[ACT_OPEN]          = (Keybind){"open",            "Open File/Folder",  GDK_KEY_Return,    0};
     app.binds[ACT_NEW_FILE]       = (Keybind){"new_file",       "New File",        GDK_KEY_n,         GDK_CONTROL_MASK};
     app.binds[ACT_NEW_DIR]        = (Keybind){"new_dir",        "New Directory",   GDK_KEY_n,         GDK_CONTROL_MASK | GDK_SHIFT_MASK};
     app.binds[ACT_RENAME]         = (Keybind){"rename",         "Rename",          GDK_KEY_3,         GDK_CONTROL_MASK};
@@ -2149,6 +2151,13 @@ static void on_menu_properties(GtkMenuItem *item, gpointer data) {
 
 static void execute_action(ActionId act) {
     switch (act) {
+        case ACT_OPEN:
+            open_currently_selected();
+            if (app.search_query[0] != '\0') {
+                app.search_query[0] = '\0';
+                update_status_bar_info();
+            }
+            break;
         case ACT_NEW_FILE: {
             char *name = prompt_text("New File", "File name:", NULL);
             if (!name) break;
@@ -3390,12 +3399,12 @@ static gboolean on_main_key_press(GtkWidget *w, GdkEventKey *ev, gpointer data) 
     }
 
     if (ev->keyval == GDK_KEY_Return || ev->keyval == GDK_KEY_KP_Enter) {
+        open_currently_selected();
         if (app.search_query[0] != '\0') {
-            open_currently_selected();
             app.search_query[0] = '\0';
             update_status_bar_info();
-            return TRUE;
         }
+        return TRUE;
     }
 
     if (ev->keyval == GDK_KEY_BackSpace) {
