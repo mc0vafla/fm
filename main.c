@@ -2342,6 +2342,7 @@ static void execute_action(ActionId act) {
         case ACT_PASTE: {
             GList *paths_to_paste = app.clipboard_paths;
             gboolean is_cut = app.clipboard_is_cut;
+            gboolean from_internal_clip = (paths_to_paste != NULL);
 
             if (!paths_to_paste) {
                 paths_to_paste = get_clipboard_paths_from_system();
@@ -2351,6 +2352,11 @@ static void execute_action(ActionId act) {
             if (!paths_to_paste) {
                 set_status("Nothing to paste");
                 break;
+            }
+
+            if (from_internal_clip) {
+                app.clipboard_paths = NULL;
+                app.clipboard_is_cut = FALSE;
             }
 
             int success_count = 0;
@@ -2364,14 +2370,7 @@ static void execute_action(ActionId act) {
                 set_status("%s %d items successfully", is_cut ? "Moved" : "Pasted", success_count);
             }
 
-            if (is_cut && app.clipboard_paths) {
-                free_string_list(&app.clipboard_paths);
-                app.clipboard_is_cut = FALSE;
-            }
-
-            if (paths_to_paste != app.clipboard_paths) {
-                free_string_list(&paths_to_paste);
-            }
+            free_string_list(&paths_to_paste);
             break;
         }
         case ACT_UNDO:
