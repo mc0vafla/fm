@@ -655,7 +655,7 @@ static void thumbnail_worker_thread(gpointer data, gpointer user_data) {
 }
 
 static void init_default_binds(void) {
-    app.binds[ACT_OPEN]          = (Keybind){"open",            "Open File/Folder",  GDK_KEY_Return,    0};
+    app.binds[ACT_OPEN]           = (Keybind){"open",           "Open File/Folder",GDK_KEY_Return,    0};
     app.binds[ACT_NEW_FILE]       = (Keybind){"new_file",       "New File",        GDK_KEY_n,         GDK_CONTROL_MASK};
     app.binds[ACT_NEW_DIR]        = (Keybind){"new_dir",        "New Directory",   GDK_KEY_n,         GDK_CONTROL_MASK | GDK_SHIFT_MASK};
     app.binds[ACT_RENAME]         = (Keybind){"rename",         "Rename",          GDK_KEY_3,         GDK_CONTROL_MASK};
@@ -671,7 +671,7 @@ static void init_default_binds(void) {
     app.binds[ACT_REFRESH]        = (Keybind){"refresh",        "Refresh",         GDK_KEY_r,         GDK_CONTROL_MASK};
     app.binds[ACT_HIDDEN]         = (Keybind){"hidden",         "Toggle Hidden",   GDK_KEY_h,         GDK_CONTROL_MASK};
     app.binds[ACT_FOCUS_PATH]     = (Keybind){"focus_path",     "Focus Path Bar",  GDK_KEY_l,         GDK_CONTROL_MASK};
-    app.binds[ACT_PIN_CURRENT]    = (Keybind){"pin_current",     "Pin Current Dir", GDK_KEY_d,         GDK_CONTROL_MASK};
+    app.binds[ACT_PIN_CURRENT]    = (Keybind){"pin_current",    "Pin Current Dir", GDK_KEY_d,         GDK_CONTROL_MASK};
     app.binds[ACT_SETTINGS]       = (Keybind){"settings",       "Preferences",     GDK_KEY_comma,     GDK_CONTROL_MASK};
     app.binds[ACT_CUSTOM_MENU_CFG]= (Keybind){"custom_menu",    "Custom Actions",  GDK_KEY_comma,     GDK_MOD1_MASK};
     app.binds[ACT_VIEW_LIST]      = (Keybind){"view_list",      "List View",       GDK_KEY_1,         GDK_CONTROL_MASK};
@@ -680,7 +680,7 @@ static void init_default_binds(void) {
 
 static void save_config(void) {
     GKeyFile *kf = g_key_file_new();
-    g_key_file_set_string(kf, "General", "terminal", app.terminal_cmd ? app.terminal_cmd : "l-term");
+    g_key_file_set_string(kf,  "General", "terminal", app.terminal_cmd ? app.terminal_cmd : "l-term");
     g_key_file_set_boolean(kf, "General", "show_hidden", app.show_hidden);
     g_key_file_set_integer(kf, "General", "view_mode", (int)app.view_mode);
     g_key_file_set_integer(kf, "General", "sort_mode", (int)app.sort_mode);
