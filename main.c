@@ -1859,10 +1859,14 @@ static void on_menu_compress_zip(GtkMenuItem *item, gpointer data) {
     g_free(q_name);
 
     for (GList *l = sel; l != NULL; l = l->next) {
-        g_string_append(cmd, " ");
-        char *q_path = g_shell_quote((char *)l->data);
-        g_string_append(cmd, q_path);
-        g_free(q_path);
+        char *base = g_path_get_basename((char *)l->data);
+        if (base) {
+            g_string_append(cmd, " ");
+            char *q_path = g_shell_quote(base);
+            g_string_append(cmd, q_path);
+            g_free(q_path);
+            g_free(base);
+        }
     }
     run_command_with_progress("Compressing to ZIP...", cmd->str, "Archive operation completed");
     g_string_free(cmd, TRUE);
@@ -1885,10 +1889,14 @@ static void on_menu_compress_tar(GtkMenuItem *item, gpointer data) {
     g_free(q_name);
 
     for (GList *l = sel; l != NULL; l = l->next) {
-        g_string_append(cmd, " ");
-        char *q_path = g_shell_quote((char *)l->data);
-        g_string_append(cmd, q_path);
-        g_free(q_path);
+        char *base = g_path_get_basename((char *)l->data);
+        if (base) {
+            g_string_append(cmd, " ");
+            char *q_path = g_shell_quote(base);
+            g_string_append(cmd, q_path);
+            g_free(q_path);
+            g_free(base);
+        }
     }
     run_command_with_progress("Compressing to TAR.GZ...", cmd->str, "Archive operation completed");
     g_string_free(cmd, TRUE);
@@ -1911,10 +1919,14 @@ static void on_menu_compress_7z(GtkMenuItem *item, gpointer data) {
     g_free(q_name);
 
     for (GList *l = sel; l != NULL; l = l->next) {
-        g_string_append(cmd, " ");
-        char *q_path = g_shell_quote((char *)l->data);
-        g_string_append(cmd, q_path);
-        g_free(q_path);
+        char *base = g_path_get_basename((char *)l->data);
+        if (base) {
+            g_string_append(cmd, " ");
+            char *q_path = g_shell_quote(base);
+            g_string_append(cmd, q_path);
+            g_free(q_path);
+            g_free(base);
+        }
     }
     run_command_with_progress("Compressing to 7Z...", cmd->str, "Archive operation completed");
     g_string_free(cmd, TRUE);
