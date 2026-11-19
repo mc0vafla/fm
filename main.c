@@ -844,6 +844,51 @@ static gboolean delete_recursive(GFile *file, GError **error) {
     return g_file_delete(file, NULL, error);
 }
 
+static gboolean copy_recursive(GFile *src, GFile *dst, GFileCopyFlags flags, GError **error) {
+    GFileType type = g_file_query_file_type(src, G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, NULL);
+
+    if (type == G_FILE_TYPE_DIRECTORY) {
+        if (!g_file_make_directory_with_parents(dst, NULL, error)) {
+            if (!g_error_matches(*error, G_IO_ERROR, G_IO_ERROR_EXISTS)) {
+                return FALSE;
+            }
+            g_clear_error(error);
+        }
+
+        GFileEnumerator *en = g_file_enumerate_children(
+            src,
+            G_FILE_ATTRIBUTE_STANDARD_NAME,
+            G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS,
+            NULL,
+            error
+        );
+        if (!en) return FALSE;
+
+        GFileInfo *info;
+        while ((info = g_file_enumerator_next_file(en, NULL, error)) != NULL) {
+            const char *name = g_file_info_get_name(info);
+            GFile *child_src = g_file_get_child(src, name);
+            GFile *child_dst = g_file_get_child(dst, name);
+
+            gboolean ok = copy_recursive(child_src, child_dst, flags, error);
+
+            g_object_unref(child_src);
+            g_object_unref(child_dst);
+            g_object_unref(info);
+
+            if (!ok) {
+                g_object_unref(en);
+                return FALSE;
+            }
+        }
+
+        g_object_unref(en);
+        return TRUE;
+    }
+
+    return g_file_copy(src, dst, flags, NULL, NULL, NULL, error);
+}
+
 static char *find_latest_in_trash(const char *orig_path) {
     char *trash_info_dir = g_build_filename(g_get_user_data_dir(), "Trash", "info", NULL);
     char *trash_files_dir = g_build_filename(g_get_user_data_dir(), "Trash", "files", NULL);
@@ -1220,9 +1265,9 @@ static int process_file_operation(const char *src_path, const char *dest_dir, gb
         gboolean res = FALSE;
 
         if (is_move) {
-            res = g_file_move(f_src, f_dst, G_FILE_COPY_OVERWRITE, NULL, NULL, NULL, &err);
+            res = g_file_move(f_src, f_dst, G_FILE_COPY_OVERWRITE | G_FILE_COPY_NOFOLLOW_SYMLINKS, NULL, NULL, NULL, &err);
         } else {
-            res = g_file_copy(f_src, f_dst, G_FILE_COPY_OVERWRITE, NULL, NULL, NULL, &err);
+            res = copy_recursive(f_src, f_dst, G_FILE_COPY_OVERWRITE | G_FILE_COPY_NOFOLLOW_SYMLINKS, &err);
         }
 
         if (res) {
