@@ -152,6 +152,7 @@ static void load_bookmarks(void);
 static void switch_view_mode(ViewMode mode);
 static void update_status_bar_info(void);
 static void save_config(void);
+static void open_file_or_binary(const char *path);
 static void open_currently_selected(void);
 static void on_menu_properties(GtkMenuItem *item, gpointer data);
 static void unpin_path_from_bookmarks(const char *path);
@@ -420,28 +421,136 @@ static void update_status_bar_info(void) {
     free_string_list(&sel);
 }
 
+static void on_child_exited(GPid pid, gint wait_status, gpointer user_data) {
+    char *label = user_data;
+    g_spawn_close_pid(pid);
+
+    if (WIFEXITED(wait_status)) {
+        int code = WEXITSTATUS(wait_status);
+        if (code != 0) {
+            set_status("Exited (%d): %s", code, label ? label : "");
+        }
+    } else if (WIFSIGNALED(wait_status)) {
+        set_status("Killed by signal %d: %s", WTERMSIG(wait_status), label ? label : "");
+    }
+
+    g_free(label);
+}
+
+static gboolean has_executable_flag(const char *path) {
+    struct stat st;
+    if (!path || stat(path, &st) != 0) return FALSE;
+    if (!S_ISREG(st.st_mode)) return FALSE;
+    return access(path, X_OK) == 0;
+}
+
+static gboolean looks_like_executable_binary_or_script(const char *path) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return FALSE;
+
+    unsigned char hdr[4] = {0};
+    size_t n = fread(hdr, 1, sizeof(hdr), fp);
+    fclose(fp);
+
+    if (n >= 2 && hdr[0] == '#' && hdr[1] == '!') {
+        return TRUE;
+    }
+    if (n == 4 && hdr[0] == 0x7f && hdr[1] == 'E' && hdr[2] == 'L' && hdr[3] == 'F') {
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static void open_file_or_binary(const char *path) {
+    if (!path) return;
+    if (g_str_has_prefix(app.current_dir, "trash:///")) {
+        set_status("Operation not supported directly from trash view");
+        return;
+    }
+
+    if (g_file_test(path, G_FILE_TEST_IS_DIR)) {
+        navigate_to(path, TRUE);
+        return;
+    }
+
+    if (has_executable_flag(path) && looks_like_executable_binary_or_script(path)) {
+        char *argv[] = { (char *)path, NULL };
+        GError *err = NULL;
+        GPid pid = 0;
+        const char *work_dir = (app.current_dir && !g_str_has_prefix(app.current_dir, "trash:///")) ? app.current_dir : NULL;
+
+        char **envp = g_get_environ();
+        char *bin_dir = g_path_get_dirname(path);
+        const char *cur_ld = g_environ_getenv(envp, "LD_LIBRARY_PATH");
+        char *new_ld = NULL;
+
+        if (bin_dir && *bin_dir) {
+            if (cur_ld && *cur_ld) {
+                new_ld = g_strdup_printf("%s:%s", bin_dir, cur_ld);
+            } else {
+                new_ld = g_strdup(bin_dir);
+            }
+            envp = g_environ_setenv(envp, "LD_LIBRARY_PATH", new_ld, TRUE);
+        }
+
+        if (g_spawn_async(work_dir, argv, envp, G_SPAWN_DO_NOT_REAP_CHILD, NULL, NULL, &pid, &err)) {
+            char *base = g_path_get_basename(path);
+            set_status("Launched executable: %s", base ? base : path);
+            g_child_watch_add(pid, on_child_exited, g_strdup(base ? base : path));
+            g_free(base);
+        } else {
+            set_status("Executable launch failed: %s", err ? err->message : "unknown error");
+            if (err) g_error_free(err);
+        }
+
+        g_free(new_ld);
+        g_free(bin_dir);
+        g_strfreev(envp);
+        return;
+    }
+
+    char *uri = g_filename_to_uri(path, NULL, NULL);
+    if (uri) {
+        GError *app_err = NULL;
+        if (!g_app_info_launch_default_for_uri(uri, NULL, &app_err)) {
+            char *xdg_argv[] = { "xdg-open", (char *)path, NULL };
+            GError *xdg_err = NULL;
+            if (g_spawn_async(app.current_dir, xdg_argv, NULL, G_SPAWN_SEARCH_PATH, NULL, NULL, NULL, &xdg_err)) {
+                set_status("Opened via xdg-open: %s", path);
+                if (app_err) g_error_free(app_err);
+                g_free(uri);
+                return;
+            }
+            if (xdg_err) g_error_free(xdg_err);
+
+            const char *work_dir = (app.current_dir && !g_str_has_prefix(app.current_dir, "trash:///")) ? app.current_dir : NULL;
+            char *q_path = g_shell_quote(path);
+            char *cmd = g_strdup_printf("nvim %s", q_path);
+            char *argv[] = { app.terminal_cmd ? app.terminal_cmd : "l-term", "-e", "/bin/sh", "-c", cmd, NULL };
+            GError *term_err = NULL;
+
+            if (g_spawn_async(work_dir, argv, NULL, G_SPAWN_SEARCH_PATH, NULL, NULL, NULL, &term_err)) {
+                set_status("Opened in editor: %s", path);
+            } else {
+                set_status("Open error: %s", app_err ? app_err->message : "no handler");
+                if (term_err) g_error_free(term_err);
+            }
+
+            g_free(cmd);
+            g_free(q_path);
+            if (app_err) g_error_free(app_err);
+        }
+        g_free(uri);
+    }
+}
+
 static void open_currently_selected(void) {
     GList *sel = get_selected_paths();
     if (!sel || !sel->data) {
         free_string_list(&sel);
         return;
     }
-    const char *path = sel->data;
-    if (g_str_has_prefix(app.current_dir, "trash:///")) {
-        set_status("Operation not supported directly from trash view");
-        free_string_list(&sel);
-        return;
-    }
-
-    if (g_file_test(path, G_FILE_TEST_IS_DIR)) {
-        navigate_to(path, TRUE);
-    } else {
-        char *uri = g_filename_to_uri(path, NULL, NULL);
-        if (uri) {
-            g_app_info_launch_default_for_uri(uri, NULL, NULL);
-            g_free(uri);
-        }
-    }
+    open_file_or_binary((const char *)sel->data);
     free_string_list(&sel);
 }
 
@@ -2526,22 +2635,7 @@ static void on_menu_sort_time(GtkMenuItem *item, gpointer data) { (void)item; (v
 
 static void on_menu_open(GtkMenuItem *item, gpointer data) {
     (void)item; (void)data;
-    GList *sel = get_selected_paths();
-    if (!sel || !sel->data) {
-        free_string_list(&sel);
-        return;
-    }
-    const char *path = sel->data;
-    if (g_file_test(path, G_FILE_TEST_IS_DIR)) {
-        navigate_to(path, TRUE);
-    } else {
-        char *uri = g_filename_to_uri(path, NULL, NULL);
-        if (uri) {
-            g_app_info_launch_default_for_uri(uri, NULL, NULL);
-            g_free(uri);
-        }
-    }
-    free_string_list(&sel);
+    open_currently_selected();
 }
 
 static void on_menu_pin_folder(GtkMenuItem *item, gpointer data) {
@@ -3358,25 +3452,11 @@ static void on_row_activated(GtkTreeView *tv, GtkTreePath *path, GtkTreeViewColu
     if (!gtk_tree_model_get_iter(model, &iter, path)) return;
 
     char *full_path = NULL;
-    gboolean is_dir = FALSE;
-    gtk_tree_model_get(model, &iter, COL_FULL_PATH, &full_path, COL_IS_DIR, &is_dir, -1);
-
-    if (g_str_has_prefix(app.current_dir, "trash:///")) {
-        set_status("Operation not supported directly from trash view");
+    gtk_tree_model_get(model, &iter, COL_FULL_PATH, &full_path, -1);
+    if (full_path) {
+        open_file_or_binary(full_path);
         g_free(full_path);
-        return;
     }
-
-    if (is_dir) {
-        navigate_to(full_path, TRUE);
-    } else {
-        char *uri = g_filename_to_uri(full_path, NULL, NULL);
-        if (uri) {
-            g_app_info_launch_default_for_uri(uri, NULL, NULL);
-            g_free(uri);
-        }
-    }
-    g_free(full_path);
 }
 
 static void on_icon_activated(GtkIconView *iv, GtkTreePath *path, gpointer data) {
@@ -3386,25 +3466,11 @@ static void on_icon_activated(GtkIconView *iv, GtkTreePath *path, gpointer data)
     if (!gtk_tree_model_get_iter(model, &iter, path)) return;
 
     char *full_path = NULL;
-    gboolean is_dir = FALSE;
-    gtk_tree_model_get(model, &iter, COL_FULL_PATH, &full_path, COL_IS_DIR, &is_dir, -1);
-
-    if (g_str_has_prefix(app.current_dir, "trash:///")) {
-        set_status("Operation not supported directly from trash view");
+    gtk_tree_model_get(model, &iter, COL_FULL_PATH, &full_path, -1);
+    if (full_path) {
+        open_file_or_binary(full_path);
         g_free(full_path);
-        return;
     }
-
-    if (is_dir) {
-        navigate_to(full_path, TRUE);
-    } else {
-        char *uri = g_filename_to_uri(full_path, NULL, NULL);
-        if (uri) {
-            g_app_info_launch_default_for_uri(uri, NULL, NULL);
-            g_free(uri);
-        }
-    }
-    g_free(full_path);
 }
 
 static void on_selection_changed(gpointer data) {
