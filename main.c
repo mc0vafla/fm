@@ -102,6 +102,14 @@ typedef struct {
 } ThumbnailTask;
 
 typedef struct {
+    char *name;
+    char *full_path;
+    goffset size;
+    gint64 mtime;
+    gboolean is_dir;
+} DirEntryItem;
+
+typedef struct {
     GtkWidget *window;
     GtkWidget *path_entry;
     GtkWidget *content_stack;
@@ -160,10 +168,13 @@ static gboolean is_path_in_gtk_bookmarks(const char *path);
 static void add_sidebar_item(const char *label, const char *path, const char *icon_name, gboolean is_trash, gboolean is_mount, GMount *mount);
 static GdkPixbuf *get_fast_file_icon(gboolean is_dir, const char *name, int size);
 static void push_undo(UndoType type, const char *src, const char *dst);
+static void free_undo_op(UndoOp *op);
+static char *find_latest_in_trash(const char *orig_path);
 static void on_view_drag_data_received(GtkWidget *widget, GdkDragContext *context, gint x, gint y, GtkSelectionData *selection_data, guint info, guint time, gpointer user_data);
 static gboolean handle_context_menu(GdkEventButton *ev, gboolean is_row);
 static void go_back(void);
 static void go_forward(void);
+static void setup_dir_monitor(const char *path);
 
 typedef struct {
     GtkWidget *dialog;
@@ -176,7 +187,7 @@ typedef struct {
 static gboolean on_progress_tick(gpointer user_data) {
     ProgressCtx *ctx = user_data;
     if (!ctx || !ctx->progress_bar) return G_SOURCE_REMOVE;
-    
+
     gtk_progress_bar_pulse(GTK_PROGRESS_BAR(ctx->progress_bar));
 
     int status = 0;
@@ -252,7 +263,8 @@ static char *format_size(goffset size, gboolean is_dir) {
 
 static char *get_free_space_string(const char *path) {
     struct statvfs stat;
-    if (statvfs(path ? path : "/", &stat) == 0) {
+    const char *target = (path && !g_str_has_prefix(path, "trash:///")) ? path : "/";
+    if (statvfs(target, &stat) == 0) {
         guint64 free_space = (guint64)stat.f_bavail * (guint64)stat.f_frsize;
         return format_size(free_space, FALSE);
     }
@@ -262,7 +274,7 @@ static char *get_free_space_string(const char *path) {
 static GList *get_selected_paths(void) {
     GList *paths = NULL;
     pthread_mutex_lock(&app.state_mutex);
-    
+
     if (app.view_mode == VIEW_MODE_LIST) {
         if (!app.tree_view || !GTK_IS_TREE_VIEW(app.tree_view) || !gtk_widget_get_realized(app.tree_view)) {
             pthread_mutex_unlock(&app.state_mutex);
@@ -273,7 +285,7 @@ static GList *get_selected_paths(void) {
             pthread_mutex_unlock(&app.state_mutex);
             return NULL;
         }
-        
+
         GtkTreeModel *model = NULL;
         GList *rows = gtk_tree_selection_get_selected_rows(sel, &model);
         if (!rows || !model || !GTK_IS_TREE_MODEL(model)) {
@@ -419,6 +431,307 @@ static void update_status_bar_info(void) {
 
     g_free(free_space);
     free_string_list(&sel);
+}
+
+static void free_undo_op(UndoOp *op) {
+    if (!op) return;
+    g_free(op->src);
+    g_free(op->dst);
+    g_free(op);
+}
+
+static void push_undo(UndoType type, const char *src, const char *dst) {
+    UndoOp *op = g_new0(UndoOp, 1);
+    op->type = type;
+    op->src = src ? g_strdup(src) : NULL;
+    op->dst = dst ? g_strdup(dst) : NULL;
+    app.undo_stack = g_list_prepend(app.undo_stack, op);
+}
+
+static char *find_latest_in_trash(const char *orig_path) {
+    if (!orig_path) return NULL;
+    char *target_base = g_path_get_basename(orig_path);
+    char *trash_files = g_build_filename(g_get_user_data_dir(), "Trash", "files", NULL);
+    GDir *dir = g_dir_open(trash_files, 0, NULL);
+    char *found_path = NULL;
+
+    if (dir && target_base) {
+        const char *name;
+        while ((name = g_dir_read_name(dir)) != NULL) {
+            if (g_strcmp0(name, target_base) == 0 || g_str_has_prefix(name, target_base)) {
+                char *candidate = g_build_filename(trash_files, name, NULL);
+                g_free(found_path);
+                found_path = candidate;
+            }
+        }
+        g_dir_close(dir);
+    }
+
+    g_free(trash_files);
+    g_free(target_base);
+    return found_path;
+}
+
+static int compare_dir_entries(gconstpointer a, gconstpointer b) {
+    const DirEntryItem *ea = a;
+    const DirEntryItem *eb = b;
+
+    if (ea->is_dir != eb->is_dir) {
+        return ea->is_dir ? -1 : 1;
+    }
+
+    switch (app.sort_mode) {
+        case SORT_NAME_DESC:
+            return g_utf8_collate(eb->name, ea->name);
+        case SORT_SIZE:
+            if (ea->size != eb->size) return (ea->size > eb->size) ? -1 : 1;
+            return g_utf8_collate(ea->name, eb->name);
+        case SORT_TIME:
+            if (ea->mtime != eb->mtime) return (ea->mtime > eb->mtime) ? -1 : 1;
+            return g_utf8_collate(ea->name, eb->name);
+        case SORT_NAME_ASC:
+        default:
+            return g_utf8_collate(ea->name, eb->name);
+    }
+}
+
+static void free_dir_entry_item(gpointer data) {
+    DirEntryItem *item = data;
+    if (!item) return;
+    g_free(item->name);
+    g_free(item->full_path);
+    g_free(item);
+}
+
+static void on_dir_monitor_changed(GFileMonitor *monitor, GFile *file, GFile *other_file,
+                                   GFileMonitorEvent event_type, gpointer user_data) {
+    (void)monitor; (void)file; (void)other_file; (void)user_data;
+    if (event_type == G_FILE_MONITOR_EVENT_CREATED ||
+        event_type == G_FILE_MONITOR_EVENT_DELETED ||
+        event_type == G_FILE_MONITOR_EVENT_RENAMED ||
+        event_type == G_FILE_MONITOR_EVENT_MOVED_IN ||
+        event_type == G_FILE_MONITOR_EVENT_MOVED_OUT) {
+        refresh_dir();
+    }
+}
+
+static void setup_dir_monitor(const char *path) {
+    if (app.dir_monitor) {
+        g_file_monitor_cancel(app.dir_monitor);
+        g_object_unref(app.dir_monitor);
+        app.dir_monitor = NULL;
+    }
+
+    if (!path || g_str_has_prefix(path, "trash:///") || !g_file_test(path, G_FILE_TEST_IS_DIR)) {
+        return;
+    }
+
+    GFile *dir_file = g_file_new_for_path(path);
+    app.dir_monitor = g_file_monitor_directory(dir_file, G_FILE_MONITOR_NONE, NULL, NULL);
+    if (app.dir_monitor) {
+        g_signal_connect(app.dir_monitor, "changed", G_CALLBACK(on_dir_monitor_changed), NULL);
+    }
+    g_object_unref(dir_file);
+}
+
+static void refresh_dir(void) {
+    if (!app.current_dir || !app.list_store) return;
+
+    pthread_mutex_lock(&app.state_mutex);
+    app.generation_id++;
+    guint gen = app.generation_id;
+    pthread_mutex_unlock(&app.state_mutex);
+
+    gtk_list_store_clear(app.list_store);
+
+    GList *items = NULL;
+    int list_icon_size = 22;
+    int active_size = (app.view_mode == VIEW_MODE_ICONS) ? app.icon_size : list_icon_size;
+
+    if (g_str_has_prefix(app.current_dir, "trash:///")) {
+        char *trash_files = g_build_filename(g_get_user_data_dir(), "Trash", "files", NULL);
+        GDir *dir = g_dir_open(trash_files, 0, NULL);
+        if (dir) {
+            const char *name;
+            while ((name = g_dir_read_name(dir)) != NULL) {
+                char *full_path = g_build_filename(trash_files, name, NULL);
+                struct stat st;
+                gboolean is_dir = FALSE;
+                goffset sz = 0;
+                gint64 mtime = 0;
+                if (lstat(full_path, &st) == 0) {
+                    is_dir = S_ISDIR(st.st_mode);
+                    sz = st.st_size;
+                    mtime = st.st_mtime;
+                }
+                DirEntryItem *it = g_new0(DirEntryItem, 1);
+                it->name = g_strdup(name);
+                it->full_path = full_path;
+                it->size = sz;
+                it->mtime = mtime;
+                it->is_dir = is_dir;
+                items = g_list_prepend(items, it);
+            }
+            g_dir_close(dir);
+        }
+        g_free(trash_files);
+    } else {
+        GError *err = NULL;
+        GDir *dir = g_dir_open(app.current_dir, 0, &err);
+        if (!dir) {
+            set_status("Cannot open directory: %s", err ? err->message : strerror(errno));
+            if (err) g_error_free(err);
+            update_status_bar_info();
+            return;
+        }
+
+        const char *name;
+        while ((name = g_dir_read_name(dir)) != NULL) {
+            if (!app.show_hidden && name[0] == '.') continue;
+            char *full_path = g_build_filename(app.current_dir, name, NULL);
+            struct stat st;
+            gboolean is_dir = FALSE;
+            goffset sz = 0;
+            gint64 mtime = 0;
+            if (lstat(full_path, &st) == 0) {
+                is_dir = S_ISDIR(st.st_mode);
+                sz = st.st_size;
+                mtime = st.st_mtime;
+            }
+            DirEntryItem *it = g_new0(DirEntryItem, 1);
+            it->name = g_strdup(name);
+            it->full_path = full_path;
+            it->size = sz;
+            it->mtime = mtime;
+            it->is_dir = is_dir;
+            items = g_list_prepend(items, it);
+        }
+        g_dir_close(dir);
+    }
+
+    items = g_list_sort(items, compare_dir_entries);
+
+    for (GList *l = items; l != NULL; l = l->next) {
+        DirEntryItem *it = l->data;
+        GdkPixbuf *pix = get_fast_file_icon(it->is_dir, it->name, active_size);
+        char *sz_str = format_size(it->size, it->is_dir);
+
+        GtkTreeIter iter;
+        gtk_list_store_append(app.list_store, &iter);
+        gtk_list_store_set(app.list_store, &iter,
+                           COL_PIXBUF, pix,
+                           COL_NAME, it->name,
+                           COL_DISPLAY_NAME, it->name,
+                           COL_SIZE, sz_str,
+                           COL_IS_DIR, it->is_dir,
+                           COL_FULL_PATH, it->full_path,
+                           -1);
+
+        if (pix) g_object_unref(pix);
+        g_free(sz_str);
+
+        if (!it->is_dir && app.thread_pool && !g_str_has_prefix(app.current_dir, "trash:///")) {
+            ThumbnailTask *task = g_new0(ThumbnailTask, 1);
+            task->full_path = g_strdup(it->full_path);
+            task->icon_size = active_size;
+            task->gen_id = gen;
+            g_thread_pool_push(app.thread_pool, task, NULL);
+        }
+    }
+
+    g_list_free_full(items, free_dir_entry_item);
+    update_status_bar_info();
+}
+
+static char *expand_tilde_path(const char *raw_path) {
+    if (!raw_path || !*raw_path) return NULL;
+    if (g_strcmp0(raw_path, "~") == 0) {
+        return g_strdup(g_get_home_dir());
+    }
+    if (g_str_has_prefix(raw_path, "~/")) {
+        return g_build_filename(g_get_home_dir(), raw_path + 2, NULL);
+    }
+    return g_strdup(raw_path);
+}
+
+static void navigate_to(const char *path, gboolean record_history) {
+    if (!path || !*path) return;
+
+    char *resolved = NULL;
+    if (g_strcmp0(path, "trash:///") == 0) {
+        resolved = g_strdup("trash:///");
+    } else {
+        char *expanded = expand_tilde_path(path);
+        char *abs_path = g_path_is_absolute(expanded)
+            ? g_strdup(expanded)
+            : g_build_filename(app.current_dir ? app.current_dir : "/", expanded, NULL);
+        g_free(expanded);
+
+        char real_buf[PATH_MAX];
+        if (realpath(abs_path, real_buf) != NULL) {
+            resolved = g_strdup(real_buf);
+        } else {
+            resolved = g_strdup(abs_path);
+        }
+        g_free(abs_path);
+
+        if (!g_file_test(resolved, G_FILE_TEST_IS_DIR)) {
+            set_status("Not a directory: %s", resolved);
+            g_free(resolved);
+            return;
+        }
+    }
+
+    if (app.current_dir && g_strcmp0(app.current_dir, resolved) == 0) {
+        if (app.path_entry && GTK_IS_ENTRY(app.path_entry)) {
+            gtk_entry_set_text(GTK_ENTRY(app.path_entry), resolved);
+        }
+        g_free(resolved);
+        refresh_dir();
+        return;
+    }
+
+    if (record_history && app.current_dir) {
+        app.history_back = g_list_prepend(app.history_back, g_strdup(app.current_dir));
+        free_string_list(&app.history_fwd);
+    }
+
+    g_free(app.current_dir);
+    app.current_dir = resolved;
+    app.search_query[0] = '\0';
+
+    if (app.path_entry && GTK_IS_ENTRY(app.path_entry)) {
+        gtk_entry_set_text(GTK_ENTRY(app.path_entry), app.current_dir);
+    }
+
+    setup_dir_monitor(app.current_dir);
+    refresh_dir();
+}
+
+static void go_back(void) {
+    if (!app.history_back) return;
+    char *prev = app.history_back->data;
+    app.history_back = g_list_delete_link(app.history_back, app.history_back);
+
+    if (app.current_dir) {
+        app.history_fwd = g_list_prepend(app.history_fwd, g_strdup(app.current_dir));
+    }
+
+    navigate_to(prev, FALSE);
+    g_free(prev);
+}
+
+static void go_forward(void) {
+    if (!app.history_fwd) return;
+    char *next = app.history_fwd->data;
+    app.history_fwd = g_list_delete_link(app.history_fwd, app.history_fwd);
+
+    if (app.current_dir) {
+        app.history_back = g_list_prepend(app.history_back, g_strdup(app.current_dir));
+    }
+
+    navigate_to(next, FALSE);
+    g_free(next);
 }
 
 static void on_child_exited(GPid pid, gint wait_status, gpointer user_data) {
@@ -630,8 +943,8 @@ static GdkPixbuf *get_fast_file_icon(gboolean is_dir, const char *name, int size
             if (g_ascii_strcasecmp(name, "Makefile") == 0 || g_ascii_strcasecmp(name, "CMakeLists.txt") == 0) {
                 icn = "text-x-script";
             } else if (ext) {
-                if (g_ascii_strcasecmp(ext, ".png") == 0 || g_ascii_strcasecmp(ext, ".jpg") == 0 || 
-                    g_ascii_strcasecmp(ext, ".jpeg") == 0 || g_ascii_strcasecmp(ext, ".gif") == 0 || 
+                if (g_ascii_strcasecmp(ext, ".png") == 0 || g_ascii_strcasecmp(ext, ".jpg") == 0 ||
+                    g_ascii_strcasecmp(ext, ".jpeg") == 0 || g_ascii_strcasecmp(ext, ".gif") == 0 ||
                     g_ascii_strcasecmp(ext, ".webp") == 0 || g_ascii_strcasecmp(ext, ".bmp") == 0) {
                     icn = "image-x-generic";
                 } else if (g_ascii_strcasecmp(ext, ".mp3") == 0 || g_ascii_strcasecmp(ext, ".flac") == 0 || g_ascii_strcasecmp(ext, ".wav") == 0) {
@@ -678,7 +991,7 @@ static GdkPixbuf *get_heavy_thumbnail(const char *full_path, int size) {
     char *hash_filename = g_strconcat(hash, ".png", NULL);
     char *thumb_path_normal = g_build_filename(g_get_user_cache_dir(), "thumbnails", "normal", hash_filename, NULL);
     char *thumb_path_large = g_build_filename(g_get_user_cache_dir(), "thumbnails", "large", hash_filename, NULL);
-    
+
     if (thumb_path_large && g_file_test(thumb_path_large, G_FILE_TEST_EXISTS) && size > 128) {
         pix = gdk_pixbuf_new_from_file_at_scale(thumb_path_large, size, size, TRUE, NULL);
     }
@@ -689,22 +1002,22 @@ static GdkPixbuf *get_heavy_thumbnail(const char *full_path, int size) {
     if (!pix) {
         const char *ext = strrchr(full_path, '.');
         gboolean is_mp3 = ext && (g_ascii_strcasecmp(ext, ".mp3") == 0 || g_ascii_strcasecmp(ext, ".flac") == 0);
-        gboolean is_video = ext && (g_ascii_strcasecmp(ext, ".mp4") == 0 || 
-                                   g_ascii_strcasecmp(ext, ".mkv") == 0 || 
-                                   g_ascii_strcasecmp(ext, ".avi") == 0 || 
-                                   g_ascii_strcasecmp(ext, ".webm") == 0 || 
+        gboolean is_video = ext && (g_ascii_strcasecmp(ext, ".mp4") == 0 ||
+                                   g_ascii_strcasecmp(ext, ".mkv") == 0 ||
+                                   g_ascii_strcasecmp(ext, ".avi") == 0 ||
+                                   g_ascii_strcasecmp(ext, ".webm") == 0 ||
                                    g_ascii_strcasecmp(ext, ".mov") == 0);
 
         char *tmp_img = g_strdup_printf("/tmp/fm_cover_%u.jpg", g_random_int());
         char *cmd = NULL;
 
         if (is_mp3) {
-            cmd = g_strdup_printf("ffmpeg -y -i %s -an -vcodec copy %s 2>/dev/null", 
-                                        g_shell_quote(full_path), 
+            cmd = g_strdup_printf("ffmpeg -y -i %s -an -vcodec copy %s 2>/dev/null",
+                                        g_shell_quote(full_path),
                                         g_shell_quote(tmp_img));
         } else if (is_video) {
-            cmd = g_strdup_printf("ffmpeg -y -ss 00:00:02 -i %s -vframes 1 %s 2>/dev/null", 
-                                        g_shell_quote(full_path), 
+            cmd = g_strdup_printf("ffmpeg -y -ss 00:00:02 -i %s -vframes 1 %s 2>/dev/null",
+                                        g_shell_quote(full_path),
                                         g_shell_quote(tmp_img));
         }
 
@@ -724,7 +1037,7 @@ static GdkPixbuf *get_heavy_thumbnail(const char *full_path, int size) {
         if (!pix) {
             pix = gdk_pixbuf_new_from_file_at_scale(full_path, size, size, TRUE, NULL);
         }
-        
+
         if (pix && thumb_path_normal) {
             char *normal_dir = g_build_filename(g_get_user_cache_dir(), "thumbnails", "normal", NULL);
             if (normal_dir) {
@@ -788,7 +1101,7 @@ static void thumbnail_worker_thread(gpointer data, gpointer user_data) {
 
     if (task->gen_id == current_gen) {
         GdkPixbuf *pix = get_heavy_thumbnail(task->full_path, task->icon_size);
-        
+
         pthread_mutex_lock(&app.state_mutex);
         guint latest_gen = app.generation_id;
         pthread_mutex_unlock(&app.state_mutex);
@@ -931,16 +1244,20 @@ static void load_config(void) {
     g_key_file_free(kf);
 }
 
-static gboolean delete_recursive(GFile *file, GError **error) {
-    GFileType type = g_file_query_file_type(file, G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, NULL);
+static gboolean delete_recursive_cancellable(GFile *file, GCancellable *cancellable, GError **error) {
+    if (g_cancellable_set_error_if_cancelled(cancellable, error)) {
+        return FALSE;
+    }
+
+    GFileType type = g_file_query_file_type(file, G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, cancellable);
     if (type == G_FILE_TYPE_DIRECTORY) {
         GFileEnumerator *en = g_file_enumerate_children(file, G_FILE_ATTRIBUTE_STANDARD_NAME,
-                                                        G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, NULL, error);
+                                                        G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, cancellable, error);
         if (!en) return FALSE;
         GFileInfo *info;
-        while ((info = g_file_enumerator_next_file(en, NULL, error)) != NULL) {
+        while ((info = g_file_enumerator_next_file(en, cancellable, error)) != NULL) {
             GFile *child = g_file_get_child(file, g_file_info_get_name(info));
-            gboolean ok = delete_recursive(child, error);
+            gboolean ok = delete_recursive_cancellable(child, cancellable, error);
             g_object_unref(child);
             g_object_unref(info);
             if (!ok) {
@@ -950,15 +1267,75 @@ static gboolean delete_recursive(GFile *file, GError **error) {
         }
         g_object_unref(en);
     }
-    return g_file_delete(file, NULL, error);
+    return g_file_delete(file, cancellable, error);
 }
 
-static gboolean copy_recursive(GFile *src, GFile *dst, GFileCopyFlags flags, GError **error) {
-    GFileType type = g_file_query_file_type(src, G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, NULL);
+static gboolean delete_recursive(GFile *file, GError **error) {
+    return delete_recursive_cancellable(file, NULL, error);
+}
+
+typedef struct {
+    GtkWidget *dialog;
+    GtkWidget *status_label;
+    GtkWidget *progress_bar;
+    GCancellable *cancellable;
+    pthread_mutex_t lock;
+    char *current_file_text;
+    gboolean done;
+    gboolean cancelled;
+    int success_count;
+    char *error_message;
+    gboolean is_move;
+    GdkDragContext *drag_context;
+    guint32 drag_time;
+    gboolean use_drag_finish;
+} FileOpProgressCtx;
+
+typedef struct {
+    GList *src_paths;
+    char *dest_dir;
+    gboolean is_move;
+    FileOpProgressCtx *pctx;
+} FileOpWorkerArgs;
+
+static void set_file_op_status_threadsafe(FileOpProgressCtx *pctx, const char *text) {
+    if (!pctx || !text) return;
+    pthread_mutex_lock(&pctx->lock);
+    g_free(pctx->current_file_text);
+    pctx->current_file_text = g_strdup(text);
+    pthread_mutex_unlock(&pctx->lock);
+}
+
+static void copy_progress_cb(goffset current_num_bytes, goffset total_num_bytes, gpointer user_data) {
+    (void)current_num_bytes;
+    (void)total_num_bytes;
+    FileOpProgressCtx *pctx = user_data;
+    if (!pctx) return;
+    if (g_cancellable_is_cancelled(pctx->cancellable)) {
+        pctx->cancelled = TRUE;
+    }
+}
+
+static gboolean copy_recursive_cancellable(GFile *src, GFile *dst, GFileCopyFlags flags,
+                                          FileOpProgressCtx *pctx, GError **error) {
+    if (g_cancellable_set_error_if_cancelled(pctx->cancellable, error)) {
+        pctx->cancelled = TRUE;
+        return FALSE;
+    }
+
+    char *base = g_file_get_basename(src);
+    if (base) {
+        char *msg = g_strdup_printf("%s: %s", pctx->is_move ? "Moving" : "Copying", base);
+        set_file_op_status_threadsafe(pctx, msg);
+        g_free(msg);
+        g_free(base);
+    }
+
+    GFileType type = g_file_query_file_type(src, G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, pctx->cancellable);
 
     if (type == G_FILE_TYPE_DIRECTORY) {
         GError *dir_err = NULL;
-        if (!g_file_make_directory_with_parents(dst, NULL, &dir_err)) {
+        if (!g_file_make_directory_with_parents(dst, pctx->cancellable, &dir_err)) {
             if (!g_error_matches(dir_err, G_IO_ERROR, G_IO_ERROR_EXISTS)) {
                 g_propagate_error(error, dir_err);
                 return FALSE;
@@ -970,18 +1347,18 @@ static gboolean copy_recursive(GFile *src, GFile *dst, GFileCopyFlags flags, GEr
             src,
             G_FILE_ATTRIBUTE_STANDARD_NAME,
             G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS,
-            NULL,
+            pctx->cancellable,
             error
         );
         if (!en) return FALSE;
 
         GFileInfo *info;
-        while ((info = g_file_enumerator_next_file(en, NULL, error)) != NULL) {
+        while ((info = g_file_enumerator_next_file(en, pctx->cancellable, error)) != NULL) {
             const char *name = g_file_info_get_name(info);
             GFile *child_src = g_file_get_child(src, name);
             GFile *child_dst = g_file_get_child(dst, name);
 
-            gboolean ok = copy_recursive(child_src, child_dst, flags, error);
+            gboolean ok = copy_recursive_cancellable(child_src, child_dst, flags, pctx, error);
 
             g_object_unref(child_src);
             g_object_unref(child_dst);
@@ -997,419 +1374,262 @@ static gboolean copy_recursive(GFile *src, GFile *dst, GFileCopyFlags flags, GEr
         return TRUE;
     }
 
-    return g_file_copy(src, dst, flags, NULL, NULL, NULL, error);
+    return g_file_copy(src, dst, flags, pctx->cancellable, copy_progress_cb, pctx, error);
 }
 
-static char *find_latest_in_trash(const char *orig_path) {
-    char *trash_info_dir = g_build_filename(g_get_user_data_dir(), "Trash", "info", NULL);
-    char *trash_files_dir = g_build_filename(g_get_user_data_dir(), "Trash", "files", NULL);
-    GDir *dir = g_dir_open(trash_info_dir, 0, NULL);
-    if (!dir) {
-        g_free(trash_info_dir);
-        g_free(trash_files_dir);
-        return NULL;
-    }
+typedef struct {
+    const char *src_path;
+    const char *dest_dir;
+    gboolean overwrite_response_ready;
+    gboolean overwrite_yes;
+} OverwritePromptData;
 
-    char *best_file = NULL;
-    time_t best_mtime = 0;
-    const char *name;
+static gboolean prompt_overwrite_in_main(gpointer user_data) {
+    OverwritePromptData *d = user_data;
+    char *basename = g_path_get_basename(d->src_path);
+    GtkWidget *dialog = gtk_message_dialog_new(
+        GTK_WINDOW(app.window),
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        GTK_MESSAGE_QUESTION,
+        GTK_BUTTONS_NONE,
+        "File already exists: %s", basename
+    );
+    gtk_message_dialog_format_secondary_text(
+        GTK_MESSAGE_DIALOG(dialog),
+        "A file with the same name already exists in this folder. Do you want to overwrite it or skip?"
+    );
+    gtk_dialog_add_button(GTK_DIALOG(dialog), "Skip", GTK_RESPONSE_NO);
+    gtk_dialog_add_button(GTK_DIALOG(dialog), "Overwrite", GTK_RESPONSE_YES);
 
-    while ((name = g_dir_read_name(dir)) != NULL) {
-        if (!g_str_has_suffix(name, ".trashinfo")) continue;
-        char *info_path = g_build_filename(trash_info_dir, name, NULL);
-        GKeyFile *kf = g_key_file_new();
-        if (g_key_file_load_from_file(kf, info_path, G_KEY_FILE_NONE, NULL)) {
-            char *raw_path = g_key_file_get_string(kf, "Trash Info", "Path", NULL);
-            if (raw_path) {
-                char *unescaped = g_uri_unescape_string(raw_path, NULL);
-                if (unescaped && g_strcmp0(unescaped, orig_path) == 0) {
-                    struct stat st;
-                    if (stat(info_path, &st) == 0 && st.st_mtime >= best_mtime) {
-                        best_mtime = st.st_mtime;
-                        g_free(best_file);
-                        char *base = g_strndup(name, strlen(name) - strlen(".trashinfo"));
-                        best_file = g_build_filename(trash_files_dir, base, NULL);
-                        g_free(base);
-                    }
-                }
-                g_free(unescaped);
-                g_free(raw_path);
-            }
+    int response = gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+    g_free(basename);
+
+    d->overwrite_yes = (response == GTK_RESPONSE_YES);
+    d->overwrite_response_ready = TRUE;
+    return G_SOURCE_REMOVE;
+}
+
+static gboolean ask_overwrite_from_worker(const char *src_path, const char *dest_dir, FileOpProgressCtx *pctx) {
+    OverwritePromptData d = {
+        .src_path = src_path,
+        .dest_dir = dest_dir,
+        .overwrite_response_ready = FALSE,
+        .overwrite_yes = FALSE
+    };
+    g_idle_add(prompt_overwrite_in_main, &d);
+
+    while (!d.overwrite_response_ready) {
+        if (g_cancellable_is_cancelled(pctx->cancellable)) {
+            return FALSE;
         }
-        g_key_file_free(kf);
-        g_free(info_path);
+        g_usleep(20000);
     }
-
-    g_dir_close(dir);
-    g_free(trash_info_dir);
-    g_free(trash_files_dir);
-    return best_file;
+    return d.overwrite_yes;
 }
 
-static void push_undo(UndoType type, const char *src, const char *dst) {
-    UndoOp *op = g_new0(UndoOp, 1);
-    op->type = type;
-    op->src = g_strdup(src);
-    op->dst = g_strdup(dst);
-    app.undo_stack = g_list_prepend(app.undo_stack, op);
-}
+static gpointer file_op_worker_thread(gpointer data) {
+    FileOpWorkerArgs *args = data;
+    FileOpProgressCtx *pctx = args->pctx;
 
-static void free_undo_op(UndoOp *op) {
-    if (!op) return;
-    g_free(op->src);
-    g_free(op->dst);
-    g_free(op);
-}
-
-static int compare_file_info(gconstpointer a, gconstpointer b, gpointer user_data) {
-    (void)user_data;
-    GFileInfo *fa = (GFileInfo *)a;
-    GFileInfo *fb = (GFileInfo *)b;
-
-    gboolean a_is_dir = (g_file_info_get_file_type(fa) == G_FILE_TYPE_DIRECTORY);
-    gboolean b_is_dir = (g_file_info_get_file_type(fb) == G_FILE_TYPE_DIRECTORY);
-
-    if (a_is_dir && !b_is_dir) return -1;
-    if (!a_is_dir && b_is_dir) return 1;
-
-    const char *na = g_file_info_get_name(fa);
-    const char *nb = g_file_info_get_name(fb);
-    if (!na) na = "";
-    if (!nb) nb = "";
-
-    if (app.sort_mode == SORT_NAME_ASC) {
-        return g_utf8_collate(na, nb);
-    } else if (app.sort_mode == SORT_NAME_DESC) {
-        return g_utf8_collate(nb, na);
-    } else if (app.sort_mode == SORT_SIZE) {
-        goffset sa = g_file_info_get_size(fa);
-        goffset sb = g_file_info_get_size(fb);
-        if (sa < sb) return 1;
-        if (sa > sb) return -1;
-        return g_utf8_collate(na, nb);
-    } else if (app.sort_mode == SORT_TIME) {
-        guint64 ta = g_file_info_get_attribute_uint64(fa, G_FILE_ATTRIBUTE_TIME_MODIFIED);
-        guint64 tb = g_file_info_get_attribute_uint64(fb, G_FILE_ATTRIBUTE_TIME_MODIFIED);
-        if (ta < tb) return 1;
-        if (ta > tb) return -1;
-        return g_utf8_collate(na, nb);
-    }
-
-    return g_utf8_collate(na, nb);
-}
-
-static void refresh_dir(void) {
-    if (!app.list_store || !app.path_entry || !app.current_dir) return;
-
-    pthread_mutex_lock(&app.state_mutex);
-    app.generation_id++;
-    pthread_mutex_unlock(&app.state_mutex);
-
-    app.search_query[0] = '\0';
-
-    gtk_list_store_clear(app.list_store);
-    gtk_entry_set_text(GTK_ENTRY(app.path_entry), app.current_dir);
-
-    int current_icon_size = (app.view_mode == VIEW_MODE_ICONS) ? app.icon_size : 24;
-
-    if (g_str_has_prefix(app.current_dir, "trash:///")) {
-        char *trash_files = g_build_filename(g_get_user_data_dir(), "Trash", "files", NULL);
-        GFile *dir_file = g_file_new_for_path(trash_files);
-        GFileEnumerator *en = g_file_enumerate_children(dir_file, G_FILE_ATTRIBUTE_STANDARD_NAME ","
-                                                        G_FILE_ATTRIBUTE_STANDARD_TYPE ","
-                                                        G_FILE_ATTRIBUTE_STANDARD_SIZE,
-                                                        G_FILE_QUERY_INFO_NONE, NULL, NULL);
-        if (en) {
-            GFileInfo *info;
-            while ((info = g_file_enumerator_next_file(en, NULL, NULL)) != NULL) {
-                GtkTreeIter iter;
-                const char *name = g_file_info_get_name(info);
-                char *full = g_build_filename(trash_files, name, NULL);
-                GdkPixbuf *pix = get_fast_file_icon(FALSE, name, current_icon_size);
-
-                gtk_list_store_append(app.list_store, &iter);
-                gtk_list_store_set(app.list_store, &iter,
-                                   COL_PIXBUF, pix,
-                                   COL_NAME, name,
-                                   COL_DISPLAY_NAME, name,
-                                   COL_SIZE, format_size(g_file_info_get_size(info), FALSE),
-                                   COL_IS_DIR, FALSE,
-                                   COL_FULL_PATH, full, -1);
-                if (pix) g_object_unref(pix);
-                g_free(full);
-                g_object_unref(info);
-            }
-            g_object_unref(en);
+    for (GList *l = args->src_paths; l != NULL; l = l->next) {
+        if (g_cancellable_is_cancelled(pctx->cancellable)) {
+            pctx->cancelled = TRUE;
+            break;
         }
-        g_object_unref(dir_file);
-        g_free(trash_files);
-        update_status_bar_info();
-        load_bookmarks(); 
-        return;
-    }
 
-    GFile *dir_file = g_file_new_for_path(app.current_dir);
-    GError *err = NULL;
-    GFileEnumerator *en = g_file_enumerate_children(
-        dir_file,
-        G_FILE_ATTRIBUTE_STANDARD_NAME ","
-        G_FILE_ATTRIBUTE_STANDARD_TYPE ","
-        G_FILE_ATTRIBUTE_STANDARD_SIZE ","
-        G_FILE_ATTRIBUTE_TIME_MODIFIED ","
-        G_FILE_ATTRIBUTE_STANDARD_IS_HIDDEN,
-        G_FILE_QUERY_INFO_NONE, NULL, &err);
+        const char *src_path = (const char *)l->data;
+        if (!src_path) continue;
 
-    if (!en) {
-        set_status("Error: %s", err ? err->message : "failed to open directory");
-        if (err) g_error_free(err);
-        g_object_unref(dir_file);
-        load_bookmarks();
-        return;
-    }
+        char *basename = g_path_get_basename(src_path);
+        char *dest_path = g_build_filename(args->dest_dir, basename, NULL);
 
-    GList *list = NULL;
-    GFileInfo *info;
-
-    while ((info = g_file_enumerator_next_file(en, NULL, NULL)) != NULL) {
-        const char *name = g_file_info_get_name(info);
-        gboolean hidden = (name && name[0] == '.');
-        if (!app.show_hidden && hidden) {
-            g_object_unref(info);
+        if (g_strcmp0(src_path, dest_path) == 0) {
+            g_free(basename);
+            g_free(dest_path);
             continue;
         }
-        list = g_list_prepend(list, info);
-    }
 
-    list = g_list_sort_with_data(list, (GCompareDataFunc)compare_file_info, NULL);
-
-    for (GList *l = list; l != NULL; l = l->next) {
-        GFileInfo *fi = l->data;
-        GtkTreeIter iter;
-        const char *name = g_file_info_get_name(fi);
-        char *full_path = g_build_filename(app.current_dir, name ? name : "", NULL);
-        gboolean is_dir = (g_file_info_get_file_type(fi) == G_FILE_TYPE_DIRECTORY);
-        
-        GdkPixbuf *pix = get_fast_file_icon(is_dir, name, current_icon_size);
-        char *sz = is_dir ? g_strdup("<DIR>") : format_size(g_file_info_get_size(fi), FALSE);
-
-        gtk_list_store_append(app.list_store, &iter);
-        gtk_list_store_set(app.list_store, &iter,
-                           COL_PIXBUF, pix,
-                           COL_NAME, name ? name : "",
-                           COL_DISPLAY_NAME, name ? name : "",
-                           COL_SIZE, sz,
-                           COL_IS_DIR, is_dir,
-                           COL_FULL_PATH, full_path, -1);
-        
-        gboolean can_have_thumbnail = !is_dir;
-
-        if (can_have_thumbnail) {
-            ThumbnailTask *task = g_new0(ThumbnailTask, 1);
-            task->full_path = g_build_filename(app.current_dir, name ? name : "", NULL);
-            task->icon_size = current_icon_size;
-            
-            pthread_mutex_lock(&app.state_mutex);
-            task->gen_id = app.generation_id;
-            pthread_mutex_unlock(&app.state_mutex);
-            
-            g_thread_pool_push(app.thread_pool, task, NULL);
+        gboolean skip = FALSE;
+        if (g_file_test(dest_path, G_FILE_TEST_EXISTS)) {
+            gboolean overwrite = ask_overwrite_from_worker(src_path, args->dest_dir, pctx);
+            if (!overwrite) {
+                skip = TRUE;
+            }
         }
 
-        if (pix) g_object_unref(pix);
-        g_free(sz);
-        g_free(full_path);
-        g_object_unref(fi);
-    }
+        if (!skip && !g_cancellable_is_cancelled(pctx->cancellable)) {
+            char *msg = g_strdup_printf("%s: %s", args->is_move ? "Moving" : "Copying", basename ? basename : src_path);
+            set_file_op_status_threadsafe(pctx, msg);
+            g_free(msg);
 
-    g_list_free(list);
-    g_object_unref(en);
-    g_object_unref(dir_file);
-    
-    update_status_bar_info();
-    load_bookmarks(); 
-}
+            GFile *f_src = g_file_new_for_path(src_path);
+            GFile *f_dst = g_file_new_for_path(dest_path);
+            GError *err = NULL;
+            gboolean res = FALSE;
 
-static void on_directory_changed(GFileMonitor *monitor, GFile *file, GFile *other_file, GFileMonitorEvent event_type, gpointer user_data) {
-    (void)monitor; (void)file; (void)other_file; (void)user_data;
-    if (event_type == G_FILE_MONITOR_EVENT_CHANGED ||
-        event_type == G_FILE_MONITOR_EVENT_CREATED ||
-        event_type == G_FILE_MONITOR_EVENT_DELETED ||
-        event_type == G_FILE_MONITOR_EVENT_MOVED) {
-        refresh_dir();
-    }
-}
+            GFileCopyFlags flags = G_FILE_COPY_OVERWRITE | G_FILE_COPY_NOFOLLOW_SYMLINKS;
 
-static void setup_directory_monitor(const char *path) {
-    if (app.dir_monitor) {
-        g_file_monitor_cancel(app.dir_monitor);
-        g_object_unref(app.dir_monitor);
-        app.dir_monitor = NULL;
-    }
+            if (args->is_move) {
+                GError *move_err = NULL;
+                res = g_file_move(f_src, f_dst, flags, pctx->cancellable, copy_progress_cb, pctx, &move_err);
+                if (!res && !g_cancellable_is_cancelled(pctx->cancellable)) {
+                    g_clear_error(&move_err);
+                    if (copy_recursive_cancellable(f_src, f_dst, flags, pctx, &err)) {
+                        res = delete_recursive_cancellable(f_src, pctx->cancellable, &err);
+                    }
+                } else if (!res && move_err) {
+                    g_propagate_error(&err, move_err);
+                }
+            } else {
+                res = copy_recursive_cancellable(f_src, f_dst, flags, pctx, &err);
+            }
 
-    if (!path || g_str_has_prefix(path, "trash:///")) return;
+            if (res) {
+                pctx->success_count++;
+            } else if (!g_cancellable_is_cancelled(pctx->cancellable) && err && !pctx->error_message) {
+                pctx->error_message = g_strdup(err->message);
+            }
 
-    GFile *file = g_file_new_for_path(path);
-    GError *err = NULL;
-    app.dir_monitor = g_file_monitor_directory(file, G_FILE_MONITOR_NONE, NULL, &err);
-    if (app.dir_monitor) {
-        g_signal_connect(app.dir_monitor, "changed", G_CALLBACK(on_directory_changed), NULL);
-    } else {
-        if (err) g_error_free(err);
-    }
-    g_object_unref(file);
-}
-
-static char *expand_tilde_path(const char *path) {
-    if (!path || path[0] != '~') {
-        return g_strdup(path ? path : "");
-    }
-    const char *home = g_get_home_dir();
-    if (!home || !*home) {
-        return g_strdup(path);
-    }
-    if (path[1] == '\0') {
-        return g_strdup(home);
-    }
-    if (path[1] == '/') {
-        return g_build_filename(home, path + 2, NULL);
-    }
-    return g_strdup(path);
-}
-
-static void navigate_to(const char *path, gboolean record_history) {
-    if (!path) return;
-
-    if (g_str_has_prefix(path, "trash:///")) {
-        if (record_history && app.current_dir && g_strcmp0(app.current_dir, path) != 0) {
-            app.history_back = g_list_prepend(app.history_back, g_strdup(app.current_dir));
-            free_string_list(&app.history_fwd);
+            if (err) g_error_free(err);
+            g_object_unref(f_src);
+            g_object_unref(f_dst);
         }
-        g_free(app.current_dir);
-        app.current_dir = g_strdup(path);
-        setup_directory_monitor(app.current_dir);
-        refresh_dir();
-        return;
-    }
 
-    char *expanded = expand_tilde_path(path);
-    char *real = realpath(expanded, NULL);
-    const char *target = real ? real : expanded;
-
-    if (!g_file_test(target, G_FILE_TEST_IS_DIR)) {
-        set_status("Directory not found: %s", target);
-        free(real);
-        g_free(expanded);
-        return;
-    }
-
-    if (record_history && app.current_dir && g_strcmp0(app.current_dir, target) != 0) {
-        app.history_back = g_list_prepend(app.history_back, g_strdup(app.current_dir));
-        free_string_list(&app.history_fwd);
-    }
-
-    g_free(app.current_dir);
-    app.current_dir = g_strdup(target);
-    free(real);
-    g_free(expanded);
-
-    setup_directory_monitor(app.current_dir);
-    refresh_dir();
-}
-
-static void go_back(void) {
-    if (!app.history_back) return;
-    char *prev = app.history_back->data;
-    app.history_back = g_list_delete_link(app.history_back, app.history_back);
-    app.history_fwd = g_list_prepend(app.history_fwd, g_strdup(app.current_dir));
-    navigate_to(prev, FALSE);
-    g_free(prev);
-}
-
-static void go_forward(void) {
-    if (!app.history_fwd) return;
-    char *next = app.history_fwd->data;
-    app.history_fwd = g_list_delete_link(app.history_fwd, app.history_fwd);
-    app.history_back = g_list_prepend(app.history_back, g_strdup(app.current_dir));
-    navigate_to(next, FALSE);
-    g_free(next);
-}
-
-static int process_file_operation(const char *src_path, const char *dest_dir, gboolean is_move) {
-    char *basename = g_path_get_basename(src_path);
-    char *dest_path = g_build_filename(dest_dir, basename, NULL);
-
-    if (g_strcmp0(src_path, dest_path) == 0) {
         g_free(basename);
         g_free(dest_path);
-        return 0; 
     }
 
-    gboolean skip = FALSE;
-    if (g_file_test(dest_path, G_FILE_TEST_EXISTS)) {
-        GtkWidget *dialog = gtk_message_dialog_new(
-            GTK_WINDOW(app.window),
-            GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
-            GTK_MESSAGE_QUESTION,
-            GTK_BUTTONS_NONE,
-            "File already exists: %s", basename
-        );
-        gtk_message_dialog_format_secondary_text(
-            GTK_MESSAGE_DIALOG(dialog),
-            "A file with the same name already exists in this folder. Do you want to overwrite it or skip?"
-        );
-        gtk_dialog_add_button(GTK_DIALOG(dialog), "Skip", GTK_RESPONSE_NO);
-        gtk_dialog_add_button(GTK_DIALOG(dialog), "Overwrite", GTK_RESPONSE_YES);
+    pctx->done = TRUE;
+    free_string_list(&args->src_paths);
+    g_free(args->dest_dir);
+    g_free(args);
+    return NULL;
+}
 
-        int response = gtk_dialog_run(GTK_DIALOG(dialog));
-        gtk_widget_destroy(dialog);
-
-        if (response != GTK_RESPONSE_YES) {
-            skip = TRUE;
+static void on_file_op_cancel_clicked(GtkButton *btn, gpointer user_data) {
+    (void)btn;
+    FileOpProgressCtx *pctx = user_data;
+    if (pctx && pctx->cancellable) {
+        pctx->cancelled = TRUE;
+        g_cancellable_cancel(pctx->cancellable);
+        if (pctx->status_label && GTK_IS_LABEL(pctx->status_label)) {
+            gtk_label_set_text(GTK_LABEL(pctx->status_label), "Cancelling...");
         }
     }
+}
 
-    int success = 0;
-    if (!skip) {
-        GFile *f_src = g_file_new_for_path(src_path);
-        GFile *f_dst = g_file_new_for_path(dest_path);
-        GError *err = NULL;
-        gboolean res = FALSE;
+static gboolean on_file_op_progress_tick(gpointer user_data) {
+    FileOpProgressCtx *pctx = user_data;
+    if (!pctx) return G_SOURCE_REMOVE;
 
-        GFileCopyFlags flags = G_FILE_COPY_OVERWRITE | G_FILE_COPY_NOFOLLOW_SYMLINKS;
-
-        if (is_move) {
-            GError *move_err = NULL;
-            res = g_file_move(f_src, f_dst, flags, NULL, NULL, NULL, &move_err);
-            if (!res) {
-                g_clear_error(&move_err);
-                if (copy_recursive(f_src, f_dst, flags, &err)) {
-                    res = delete_recursive(f_src, &err);
-                }
-            }
-        } else {
-            res = copy_recursive(f_src, f_dst, flags, &err);
-        }
-
-        if (res) {
-            success = 1;
-        } else {
-            if (err) {
-                set_status("Error: %s", err->message);
-                g_error_free(err);
-            }
-        }
-
-        g_object_unref(f_src);
-        g_object_unref(f_dst);
+    if (pctx->progress_bar && GTK_IS_PROGRESS_BAR(pctx->progress_bar)) {
+        gtk_progress_bar_pulse(GTK_PROGRESS_BAR(pctx->progress_bar));
     }
 
-    g_free(basename);
-    g_free(dest_path);
-    return success;
+    pthread_mutex_lock(&pctx->lock);
+    if (pctx->current_file_text && pctx->status_label && GTK_IS_LABEL(pctx->status_label)) {
+        gtk_label_set_text(GTK_LABEL(pctx->status_label), pctx->current_file_text);
+    }
+    pthread_mutex_unlock(&pctx->lock);
+
+    if (pctx->done) {
+        if (pctx->dialog && GTK_IS_WIDGET(pctx->dialog)) {
+            gtk_widget_destroy(pctx->dialog);
+            pctx->dialog = NULL;
+        }
+
+        refresh_dir();
+
+        if (pctx->error_message) {
+            set_status("Error: %s", pctx->error_message);
+        } else if (pctx->cancelled) {
+            set_status("%s cancelled (%d items completed)",
+                       pctx->is_move ? "Move" : "Copy", pctx->success_count);
+        } else if (pctx->success_count > 0) {
+            set_status("%s %d items successfully",
+                       pctx->is_move ? "Moved" : "Copied", pctx->success_count);
+        }
+
+        if (pctx->use_drag_finish && pctx->drag_context) {
+            gtk_drag_finish(pctx->drag_context,
+                            pctx->success_count > 0 && !pctx->cancelled,
+                            pctx->is_move && pctx->success_count > 0,
+                            pctx->drag_time);
+        }
+
+        pthread_mutex_destroy(&pctx->lock);
+        if (pctx->cancellable) g_object_unref(pctx->cancellable);
+        g_free(pctx->current_file_text);
+        g_free(pctx->error_message);
+        g_free(pctx);
+        return G_SOURCE_REMOVE;
+    }
+
+    return G_SOURCE_CONTINUE;
+}
+
+static void start_file_operations_with_progress(GList *src_paths, const char *dest_dir, gboolean is_move,
+                                               GdkDragContext *drag_context, guint32 drag_time, gboolean use_drag_finish) {
+    if (!src_paths || !dest_dir) {
+        free_string_list(&src_paths);
+        if (use_drag_finish && drag_context) {
+            gtk_drag_finish(drag_context, FALSE, FALSE, drag_time);
+        }
+        return;
+    }
+
+    GtkWidget *dlg = gtk_dialog_new();
+    gtk_window_set_transient_for(GTK_WINDOW(dlg), GTK_WINDOW(app.window));
+    gtk_window_set_modal(GTK_WINDOW(dlg), TRUE);
+    gtk_window_set_destroy_with_parent(GTK_WINDOW(dlg), TRUE);
+    gtk_window_set_title(GTK_WINDOW(dlg), is_move ? "Moving files..." : "Copying files...");
+    gtk_window_set_default_size(GTK_WINDOW(dlg), 380, 120);
+
+    GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dlg));
+    gtk_container_set_border_width(GTK_CONTAINER(content), 16);
+    gtk_box_set_spacing(GTK_BOX(content), 12);
+
+    GtkWidget *lbl = gtk_label_new(is_move ? "Preparing to move..." : "Preparing to copy...");
+    gtk_widget_set_halign(lbl, GTK_ALIGN_START);
+    gtk_label_set_ellipsize(GTK_LABEL(lbl), PANGO_ELLIPSIZE_MIDDLE);
+
+    GtkWidget *pbar = gtk_progress_bar_new();
+
+    GtkWidget *cancel_btn = gtk_button_new_with_label("Cancel");
+    gtk_widget_set_halign(cancel_btn, GTK_ALIGN_END);
+
+    gtk_box_pack_start(GTK_BOX(content), lbl, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(content), pbar, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(content), cancel_btn, FALSE, FALSE, 0);
+    gtk_widget_show_all(dlg);
+
+    FileOpProgressCtx *pctx = g_new0(FileOpProgressCtx, 1);
+    pctx->dialog = dlg;
+    pctx->status_label = lbl;
+    pctx->progress_bar = pbar;
+    pctx->cancellable = g_cancellable_new();
+    pthread_mutex_init(&pctx->lock, NULL);
+    pctx->current_file_text = g_strdup(is_move ? "Preparing to move..." : "Preparing to copy...");
+    pctx->is_move = is_move;
+    pctx->drag_context = drag_context;
+    pctx->drag_time = drag_time;
+    pctx->use_drag_finish = use_drag_finish;
+
+    g_signal_connect(cancel_btn, "clicked", G_CALLBACK(on_file_op_cancel_clicked), pctx);
+
+    FileOpWorkerArgs *args = g_new0(FileOpWorkerArgs, 1);
+    args->src_paths = src_paths;
+    args->dest_dir = g_strdup(dest_dir);
+    args->is_move = is_move;
+    args->pctx = pctx;
+
+    g_thread_new("file-op-worker", file_op_worker_thread, args);
+    g_timeout_add(100, on_file_op_progress_tick, pctx);
 }
 
 static void on_view_drag_data_received(GtkWidget *widget, GdkDragContext *context, gint x, gint y, GtkSelectionData *selection_data, guint info, guint time, gpointer user_data) {
-    (void)widget; (void)info; (void)time; (void)user_data;
+    (void)widget; (void)info; (void)user_data;
     const guchar *data = gtk_selection_data_get_data(selection_data);
     if (!data || *data == '\0') {
         gdk_drag_status(context, 0, time);
@@ -1464,22 +1684,14 @@ static void on_view_drag_data_received(GtkWidget *widget, GdkDragContext *contex
     GdkDragAction action = gdk_drag_context_get_selected_action(context);
     gboolean is_move = (action == GDK_ACTION_MOVE);
 
-    int success_count = 0;
+    GList *src_list = NULL;
     for (int i = 0; uris[i] != NULL; i++) {
         char *src_path = g_filename_from_uri(uris[i], NULL, NULL);
         if (!src_path) continue;
-
-        success_count += process_file_operation(src_path, dest_dir, is_move);
-        g_free(src_path);
+        src_list = g_list_append(src_list, src_path);
     }
 
-    if (success_count > 0) {
-        refresh_dir();
-        set_status("%s %d items successfully", is_move ? "Moved" : "Copied", success_count);
-        gtk_drag_finish(context, TRUE, is_move, time);
-    } else {
-        gtk_drag_finish(context, FALSE, FALSE, time);
-    }
+    start_file_operations_with_progress(src_list, dest_dir, is_move, context, time, TRUE);
 
     g_strfreev(uris);
     g_free(dest_dir);
@@ -1514,7 +1726,7 @@ static gboolean on_view_button_press(GtkWidget *widget, GdkEventButton *ev, gpoi
         drag_state.start_y = ev->y;
         drag_state.dragging_active = FALSE;
     }
-    
+
     if (ev->type == GDK_BUTTON_PRESS && ev->button == 3) {
         if (GTK_IS_TREE_VIEW(widget)) {
             GtkTreePath *path = NULL;
@@ -1547,8 +1759,8 @@ static gboolean on_view_button_press(GtkWidget *widget, GdkEventButton *ev, gpoi
             }
         }
     }
-    
-    return FALSE; 
+
+    return FALSE;
 }
 
 static gboolean on_view_motion_notify(GtkWidget *widget, GdkEventMotion *ev, gpointer data) {
@@ -1562,9 +1774,9 @@ static gboolean on_view_motion_notify(GtkWidget *widget, GdkEventMotion *ev, gpo
                 gtk_target_list_add_uri_targets(targets, 0);
 
                 gtk_drag_begin_with_coordinates(
-                    widget, targets, 
-                    GDK_ACTION_COPY | GDK_ACTION_MOVE, 
-                    1, (GdkEvent *)ev, 
+                    widget, targets,
+                    GDK_ACTION_COPY | GDK_ACTION_MOVE,
+                    1, (GdkEvent *)ev,
                     (gint)ev->x, (gint)ev->y
                 );
 
@@ -1746,7 +1958,7 @@ static void clipboard_clear_func(GtkClipboard *clipboard, gpointer user_data) {
 static GList *get_clipboard_paths_from_system(void) {
     GtkClipboard *clip = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
     GList *paths = NULL;
-    
+
     GtkSelectionData *sdata = gtk_clipboard_wait_for_contents(clip, gdk_atom_intern("text/uri-list", FALSE));
     if (sdata) {
         gchar **uris = gtk_selection_data_get_uris(sdata);
@@ -1903,14 +2115,14 @@ static void unpin_path_from_bookmarks(const char *path) {
 static void empty_trash_fully(void) {
     char *trash_files = g_build_filename(g_get_user_data_dir(), "Trash", "files", NULL);
     char *trash_info = g_build_filename(g_get_user_data_dir(), "Trash", "info", NULL);
-    
+
     GFile *f_files = g_file_new_for_path(trash_files);
     GFile *f_info = g_file_new_for_path(trash_info);
-    
+
     GError *err = NULL;
     delete_recursive(f_files, &err);
     delete_recursive(f_info, &err);
-    
+
     g_mkdir_with_parents(trash_files, 0755);
     g_mkdir_with_parents(trash_info, 0755);
 
@@ -1932,7 +2144,7 @@ static void execute_custom_action(GtkMenuItem *item, gpointer data) {
         return;
     }
     char *path = sel->data;
-    
+
     char *full_cmd = NULL;
     if (strstr(cmd_template, "%s")) {
         full_cmd = g_strdup_printf(cmd_template, path);
@@ -2233,7 +2445,7 @@ static void calculate_dir_size_recursive(const char *dir_path, DirSizeTask *task
     while ((name = g_dir_read_name(dir)) != NULL) {
         if (task->cancelled) break;
         char *full_path = g_build_filename(dir_path, name, NULL);
-        
+
         struct stat st;
         if (lstat(full_path, &st) == 0) {
             if (S_ISDIR(st.st_mode)) {
@@ -2254,9 +2466,9 @@ static gboolean update_size_label_idle(gpointer user_data) {
     if (!task->cancelled && task->size_label && GTK_IS_WIDGET(task->size_label)) {
         char *sz_str = format_size(task->total_size, FALSE);
         char buf[256];
-        snprintf(buf, sizeof(buf), "%s (%llu bytes, %llu files, %llu folders)", 
-                 sz_str, (unsigned long long)task->total_size, 
-                 (unsigned long long)task->file_count, 
+        snprintf(buf, sizeof(buf), "%s (%llu bytes, %llu files, %llu folders)",
+                 sz_str, (unsigned long long)task->total_size,
+                 (unsigned long long)task->file_count,
                  (unsigned long long)task->dir_count);
         gtk_label_set_text(GTK_LABEL(task->size_label), buf);
         g_free(sz_str);
@@ -2477,7 +2689,7 @@ static void execute_action(ActionId act) {
                 } else {
                     if (err) g_error_free(err);
                     err = NULL;
-                    
+
                     if (delete_recursive(f, &err)) {
                         count++;
                         set_status("Disk doesn't support trash. Deleted permanently: %s", path);
@@ -2502,14 +2714,14 @@ static void execute_action(ActionId act) {
             free_string_list(&app.clipboard_paths);
             app.clipboard_paths = sel;
             app.clipboard_is_cut = (act == ACT_CUT);
-            
+
             GtkClipboard *clip = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
             static GtkTargetEntry targets[] = {
                 { (gchar *)"text/uri-list", 0, 0 },
                 { (gchar *)"UTF8_STRING", 0, 1 },
                 { (gchar *)"STRING", 0, 1 }
             };
-            
+
             gtk_clipboard_set_with_data(clip, targets, 3, clipboard_get_func, clipboard_clear_func, NULL);
 
             set_status("%s: %d items", app.clipboard_is_cut ? "Cut" : "Copied",
@@ -2536,18 +2748,7 @@ static void execute_action(ActionId act) {
                 app.clipboard_is_cut = FALSE;
             }
 
-            int success_count = 0;
-            for (GList *l = paths_to_paste; l != NULL; l = l->next) {
-                char *src_path = (char *)l->data;
-                success_count += process_file_operation(src_path, app.current_dir, is_cut);
-            }
-
-            if (success_count > 0) {
-                refresh_dir();
-                set_status("%s %d items successfully", is_cut ? "Moved" : "Pasted", success_count);
-            }
-
-            free_string_list(&paths_to_paste);
+            start_file_operations_with_progress(paths_to_paste, app.current_dir, is_cut, NULL, 0, FALSE);
             break;
         }
         case ACT_UNDO:
@@ -3191,13 +3392,13 @@ static void on_sidebar_eject(GtkMenuItem *item, gpointer data) {
 static gboolean on_sidebar_button_press(GtkWidget *widget, GdkEventButton *ev, gpointer data) {
     (void)widget;
     SidebarCtx *ctx = data;
-    
+
     if (ev->type == GDK_BUTTON_PRESS && ev->button == 3) {
-        gboolean is_default_system = (ctx->path && (g_strcmp0(ctx->path, g_get_home_dir()) == 0)) || 
+        gboolean is_default_system = (ctx->path && (g_strcmp0(ctx->path, g_get_home_dir()) == 0)) ||
                                      (ctx->path && (g_strcmp0(ctx->path, g_get_user_special_dir(G_USER_DIRECTORY_DESKTOP) ? g_get_user_special_dir(G_USER_DIRECTORY_DESKTOP) : "") == 0));
-        
+
         if (is_default_system && !is_path_in_gtk_bookmarks(ctx->path)) {
-            return TRUE; 
+            return TRUE;
         }
 
         GtkWidget *menu = gtk_menu_new();
@@ -3369,13 +3570,13 @@ static void load_bookmarks(void) {
     g_list_free(children);
 
     add_sidebar_item("Home", g_get_home_dir(), "user-home", FALSE, FALSE, NULL);
-    
+
     const char *desktop_path = g_get_user_special_dir(G_USER_DIRECTORY_DESKTOP);
     if (!desktop_path) {
         desktop_path = g_build_filename(g_get_home_dir(), "Desktop", NULL);
     }
     add_sidebar_item("Desktop", desktop_path, "user-desktop", FALSE, FALSE, NULL);
-    
+
     char *trash_files_dir = g_build_filename(g_get_user_data_dir(), "Trash", "files", NULL);
     gboolean trash_has_items = FALSE;
     GDir *tdir = g_dir_open(trash_files_dir, 0, NULL);
@@ -3423,7 +3624,7 @@ static void load_bookmarks(void) {
         char **lines = g_strsplit(content, "\n", -1);
         for (int i = 0; lines[i] != NULL; i++) {
             char *line = g_strstrip(lines[i]);
-            if (*line == '\0' || *line == '#') continue; 
+            if (*line == '\0' || *line == '#') continue;
 
             char *space = strchr(line, ' ');
             char *uri = space ? g_strndup(line, space - line) : g_strdup(line);
@@ -3538,7 +3739,7 @@ static void process_quick_search_input(guint keyval) {
     GtkTreeModel *model = GTK_TREE_MODEL(app.list_store);
     GtkTreeIter iter;
     gboolean valid = gtk_tree_model_get_iter_first(model, &iter);
-    
+
     int best_score = -1;
     GtkTreePath *best_path = NULL;
 
@@ -3740,7 +3941,7 @@ static void build_ui(void) {
 
     app.tree_view = gtk_tree_view_new_with_model(GTK_TREE_MODEL(app.list_store));
     gtk_tree_view_set_rubber_banding(GTK_TREE_VIEW(app.tree_view), TRUE);
-    
+
     GtkTreeSelection *tree_sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(app.tree_view));
     gtk_tree_selection_set_mode(tree_sel, GTK_SELECTION_MULTIPLE);
     g_signal_connect_swapped(tree_sel, "changed", G_CALLBACK(on_selection_changed), NULL);
@@ -3773,7 +3974,7 @@ static void build_ui(void) {
     gtk_icon_view_set_pixbuf_column(GTK_ICON_VIEW(app.icon_view), COL_PIXBUF);
     gtk_icon_view_set_text_column(GTK_ICON_VIEW(app.icon_view), COL_NAME);
     gtk_icon_view_set_selection_mode(GTK_ICON_VIEW(app.icon_view), GTK_SELECTION_MULTIPLE);
-    
+
     GList *cells = gtk_cell_layout_get_cells(GTK_CELL_LAYOUT(app.icon_view));
     for (GList *l = cells; l != NULL; l = l->next) {
         if (GTK_IS_CELL_RENDERER_TEXT(l->data)) {
@@ -3847,15 +4048,15 @@ static void build_ui(void) {
     gtk_widget_show_all(app.window);
 
     gtk_icon_view_set_item_width(GTK_ICON_VIEW(app.icon_view), app.icon_size + 24);
-    
+
     if (app.view_mode == VIEW_MODE_ICONS) {
         gtk_stack_set_visible_child_name(GTK_STACK(app.content_stack), "icons");
         gtk_widget_grab_focus(app.icon_view);
     } else {
         gtk_stack_set_visible_child_name(GTK_STACK(app.content_stack), "list");
-        gtk_widget_grab_focus(app.tree_view); 
+        gtk_widget_grab_focus(app.tree_view);
     }
-    
+
     refresh_dir();
 }
 
